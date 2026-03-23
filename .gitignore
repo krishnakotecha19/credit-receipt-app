@@ -1,0 +1,31 @@
+# Secrets
+.env
+*.env
+.credentials.json
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+venv/
+.venv/
+
+# Uploads & cache (user data)
+uploads/
+cache/
+*.csv
+
+# Poppler binary (large, install separately)
+poppler_install/
+
+# IDE
+.vscode/
+.idea/
+
+# OS
+Thumbs.db
+.DS_Store
+
+# Test files
+_test_*.png
+_test_*.jpg

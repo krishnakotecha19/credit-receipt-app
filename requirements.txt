@@ -1,0 +1,13 @@
+streamlit
+paddleocr
+python-doctr[torch]
+pdf2image
+pandas
+opencv-python
+Pillow
+python-dateutil
+requests
+psycopg2-binary
+python-dotenv
+openpyxl
+numpy
