@@ -81,12 +81,15 @@ def _has_plus_prefix(img_rgb: np.ndarray, x_min: float, y_min: float,
 # Statement PDF → OCR words
 # ---------------------------------------------------------------------------
 
-def process_statement_pdf(pdf_path: str, poppler_path: str) -> list[dict]:
+def process_statement_pdf(pdf_path: str, poppler_path: str = None) -> list[dict]:
     from pdf2image import convert_from_path
 
     pages_out = []
     try:
-        pil_images = convert_from_path(pdf_path, dpi=300, poppler_path=poppler_path)
+        kwargs = {"dpi": 300}
+        if poppler_path:
+            kwargs["poppler_path"] = poppler_path
+        pil_images = convert_from_path(pdf_path, **kwargs)
     except Exception as e:
         return [{"page_number": 1, "raw_ocr_words": [], "status": f"failed: {e}"}]
 
@@ -143,11 +146,11 @@ def process_statement_pdf(pdf_path: str, poppler_path: str) -> list[dict]:
 
 
 if __name__ == "__main__":
-    if len(sys.argv) < 3:
-        print(json.dumps([{"error": "Usage: python ocr_statement.py <pdf_path> <poppler_path>"}]))
+    if len(sys.argv) < 2:
+        print(json.dumps([{"error": "Usage: python ocr_statement.py <pdf_path> [poppler_path]"}]))
         sys.exit(1)
 
     pdf_path = sys.argv[1]
-    poppler_path = sys.argv[2]
+    poppler_path = sys.argv[2] if len(sys.argv) >= 3 else None
     pages = process_statement_pdf(pdf_path, poppler_path)
     print(json.dumps(pages, ensure_ascii=False))

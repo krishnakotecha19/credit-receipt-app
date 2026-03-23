@@ -35,7 +35,17 @@ UPLOAD_DIR_RECEIPTS.mkdir(parents=True, exist_ok=True)
 UPLOAD_DIR_STATEMENTS.mkdir(parents=True, exist_ok=True)
 CACHE_DIR_STATEMENTS.mkdir(parents=True, exist_ok=True)
 
-POPPLER_PATH = str(Path(__file__).resolve().parent / "poppler_install" / "poppler-24.08.0" / "Library" / "bin")
+# Poppler: check multiple known locations
+_poppler_candidates = [
+    Path(__file__).resolve().parent / "poppler_install" / "poppler-24.08.0" / "Library" / "bin",
+    Path(r"C:\poppler-25.12.0\Library\bin"),
+    Path(r"C:\poppler\Library\bin"),
+]
+POPPLER_PATH = None
+for _p in _poppler_candidates:
+    if _p.exists():
+        POPPLER_PATH = str(_p)
+        break
 
 MIN_IMAGE_WIDTH = 800
 
@@ -210,7 +220,7 @@ def process_statement_pdf(pdf_path: str) -> list[dict]:
     """Run DocTR statement OCR in a subprocess."""
     try:
         proc = subprocess.run(
-            [sys.executable, _STATEMENT_WORKER, str(pdf_path), POPPLER_PATH],
+            [sys.executable, _STATEMENT_WORKER, str(pdf_path)] + ([POPPLER_PATH] if POPPLER_PATH else []),
             capture_output=True, text=True, timeout=300,
             cwd=str(_SCRIPT_DIR),
         )
