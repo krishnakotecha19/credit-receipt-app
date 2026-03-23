@@ -11,6 +11,7 @@ import sys
 import re
 import gc
 import json
+import base64
 import cv2
 import numpy as np
 import requests
@@ -666,19 +667,94 @@ def _run_ocr_on_image(img: np.ndarray) -> tuple[list[str], list[float]]:
 # directly to a vision-language model for accurate parsing
 # ---------------------------------------------------------------------------
 
-def _extract_via_llm(image_path: str, raw_text: str) -> dict | None:
-    """Send receipt OCR text to local Ollama (Qwen2.5-3B) for extraction.
+def _parse_llm_response(text: str) -> dict | None:
+    """Parse JSON from LLM response text. Handles markdown fences and extra text."""
+    if not text:
+        return None
+    cleaned = text.strip()
+    if cleaned.startswith("```"):
+        cleaned = re.sub(r"^```(?:json)?\s*", "", cleaned)
+        cleaned = re.sub(r"\s*```$", "", cleaned)
+    match = re.search(r'\{[^{}]*\}', cleaned)
+    if not match:
+        return None
+    try:
+        parsed = json.loads(match.group(0))
+    except json.JSONDecodeError:
+        return None
+    result = {}
+    if parsed.get("vendor"):
+        v = str(parsed["vendor"]).strip()
+        if v.lower() not in ("store name", "store/merchant name", "merchant name", "shop name"):
+            result["vendor"] = v
+    if parsed.get("amount") is not None:
+        try:
+            result["amount"] = float(parsed["amount"])
+        except (ValueError, TypeError):
+            pass
+    if parsed.get("date"):
+        result["date"] = str(parsed["date"]).strip()
+    return result if result else None
 
+
+def _extract_via_llm(image_path: str, raw_text: str) -> dict | None:
+    """Send receipt to local Ollama for extraction.
+
+    Uses VLM (qwen2.5vl:3b) if available — sends the actual image.
+    Falls back to text-only (qwen2.5:3b) if VLM fails or isn't installed.
     Fully offline — no data leaves the machine.
+
     Returns {"vendor": str, "amount": float, "date": "YYYY-MM-DD"} or None.
     """
     ollama_url = os.environ.get("OLLAMA_URL", "http://localhost:11434")
-    ollama_model = os.environ.get("OLLAMA_MODEL", "qwen2.5:3b")
+    ollama_model = os.environ.get("OLLAMA_MODEL", "qwen2.5vl:3b")
 
+    # ── Try VLM (vision) first — send actual image ──
+    img_b64 = None
+    try:
+        with open(image_path, "rb") as f:
+            img_b64 = base64.b64encode(f.read()).decode("utf-8")
+    except Exception:
+        pass
+
+    if img_b64 and "vl" in ollama_model.lower():
+        vlm_prompt = (
+            "Look at this receipt image carefully. Extract these 3 fields.\n"
+            "Return ONLY valid JSON: {\"vendor\": \"...\", \"amount\": number, \"date\": \"YYYY-MM-DD\"}\n\n"
+            "1. vendor: The store/restaurant/company name printed at the top of the receipt.\n"
+            "2. amount: The FINAL TOTAL amount paid (after discounts/taxes). "
+            "Look for 'Grand Total', 'Net Amount', 'Total', 'Amount Paid', 'You Pay'. "
+            "Do NOT pick subtotal, tax, CGST, SGST, discount, or MRP.\n"
+            "3. date: The billing/transaction date. Indian format DD/MM/YYYY, convert to YYYY-MM-DD.\n\n"
+            "Use null for any field you cannot read. No explanation, JSON only."
+        )
+
+        try:
+            resp = requests.post(
+                f"{ollama_url}/api/generate",
+                json={
+                    "model": ollama_model,
+                    "prompt": vlm_prompt,
+                    "images": [img_b64],
+                    "stream": False,
+                    "options": {"temperature": 0.1, "num_predict": 200},
+                },
+                timeout=180,
+            )
+            if resp.status_code == 200:
+                result = _parse_llm_response(resp.json().get("response", ""))
+                if result:
+                    print(f"VLM extraction succeeded", file=sys.stderr)
+                    return result
+            print(f"VLM failed ({resp.status_code}), falling back to text model", file=sys.stderr)
+        except Exception as e:
+            print(f"VLM error: {e}, falling back to text model", file=sys.stderr)
+
+    # ── Fallback: text-only model with OCR text ──
     if not raw_text or not raw_text.strip():
         return None
 
-    # Structure OCR text — show TOP (vendor) and BOTTOM (totals) separately
+    text_model = os.environ.get("OLLAMA_TEXT_MODEL", "qwen2.5:3b")
     raw_lines = [l.strip() for l in raw_text.split("\n") if l.strip()]
     total = len(raw_lines)
     top = "\n".join(raw_lines[:7])
@@ -693,22 +769,21 @@ def _extract_via_llm(image_path: str, raw_text: str) -> dict | None:
         f"{bottom}\n\n"
         "Extract exactly 3 fields. Return ONLY valid JSON, nothing else.\n\n"
         "VENDOR: The business name from the TOP. First or second line. "
-        "Ignore addresses, GSTIN, phone numbers. If OCR is garbled, guess the closest real business name "
-        "(e.g. 'Bhatat Petroieun' → 'Bharat Petroleum', 'DIESEE' → 'DIESEL/Shell').\n\n"
+        "Ignore addresses, GSTIN, phone numbers. If OCR is garbled, guess the closest real business name.\n\n"
         "AMOUNT: From the BOTTOM, find the FINAL amount paid. "
         "Look for: Grand Total, Net Amount, Net Amt, Total Payable, Amount Paid, You Pay, Balance Due, Total, Amt. "
         "Pick the number next to these keywords. "
         "IGNORE: Sub Total, Item Total, CGST, SGST, Tax, Discount, MRP, Rate, Qty, Volume, Saving.\n\n"
         "DATE: From TOP or BOTTOM, find the transaction date near 'Date', 'Dt', 'Bill Date'. "
         "Indian format DD/MM/YYYY → convert to YYYY-MM-DD. Ignore order IDs and invoice numbers.\n\n"
-        'Return: {"vendor": "...", "amount": number, "date": "YYYY-MM-DD"}\n'
+        '{"vendor": "...", "amount": number, "date": "YYYY-MM-DD"}\n'
         "Use null for fields you cannot find."
     )
 
     resp = requests.post(
         f"{ollama_url}/api/generate",
         json={
-            "model": ollama_model,
+            "model": text_model,
             "prompt": prompt,
             "stream": False,
             "options": {"temperature": 0.1, "num_predict": 200},
@@ -719,38 +794,7 @@ def _extract_via_llm(image_path: str, raw_text: str) -> dict | None:
         print(f"Ollama error {resp.status_code}: {resp.text[:200]}", file=sys.stderr)
         return None
 
-    text = resp.json().get("response", "")
-    if not text:
-        return None
-
-    # Strip markdown fences if present
-    cleaned = text.strip()
-    if cleaned.startswith("```"):
-        cleaned = re.sub(r"^```(?:json)?\s*", "", cleaned)
-        cleaned = re.sub(r"\s*```$", "", cleaned)
-
-    # Extract JSON object even if model added extra text
-    match = re.search(r'\{[^{}]*\}', cleaned)
-    if not match:
-        return None
-    cleaned = match.group(0)
-
-    parsed = json.loads(cleaned)
-
-    # Validate and normalize
-    result = {}
-    if parsed.get("vendor"):
-        v = str(parsed["vendor"]).strip()
-        if v.lower() not in ("store name", "store/merchant name", "merchant name", "shop name"):
-            result["vendor"] = v
-    if parsed.get("amount") is not None:
-        try:
-            result["amount"] = float(parsed["amount"])
-        except (ValueError, TypeError):
-            pass
-    if parsed.get("date"):
-        result["date"] = str(parsed["date"]).strip()
-    return result if result else None
+    return _parse_llm_response(resp.json().get("response", ""))
 
 
 def extract_receipt_data(image_path: str) -> dict:
