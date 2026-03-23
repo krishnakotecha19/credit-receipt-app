@@ -4,6 +4,26 @@ echo   Credit Receipt App - Setup Script
 echo ============================================
 echo.
 
+:: Check if Git is installed
+git --version >nul 2>&1
+if %errorlevel% neq 0 (
+    echo Git not found. Downloading Git...
+    curl -o git_installer.exe -L https://github.com/git-for-windows/git/releases/download/v2.47.1.windows.2/Git-2.47.1.2-64-bit.exe
+    echo Installing Git...
+    git_installer.exe /VERYSILENT /NORESTART
+    echo Git installed. Please CLOSE this terminal and run setup.bat again.
+    del git_installer.exe
+    pause
+    exit /b
+)
+
+:: Clone repo if not already inside it
+if not exist "app.py" (
+    echo Cloning repository...
+    git clone https://github.com/krishnakotecha19/credit-receipt-app.git
+    cd credit-receipt-app
+)
+
 :: Check if Python is installed
 python --version >nul 2>&1
 if %errorlevel% neq 0 (
