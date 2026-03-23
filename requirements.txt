@@ -7,7 +7,6 @@ opencv-python
 Pillow
 python-dateutil
 requests
-psycopg2-binary
 python-dotenv
 openpyxl
 numpy

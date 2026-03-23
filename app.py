@@ -20,8 +20,6 @@ os.environ["KMP_DUPLICATE_LIB_OK"] = "TRUE"
 os.environ["OMP_NUM_THREADS"] = "1"
 os.environ["PADDLE_PDX_DISABLE_MODEL_SOURCE_CHECK"] = "True"
 
-import psycopg2
-from psycopg2.extras import RealDictCursor
 
 # Path to the subprocess worker scripts (same directory as app.py)
 _SCRIPT_DIR = Path(__file__).resolve().parent
@@ -114,140 +112,7 @@ def _load_image_fixed(path: Path) -> Image.Image:
 
 
 # ---------------------------------------------------------------------------
-# PostgreSQL helpers
-# ---------------------------------------------------------------------------
 
-def _get_db_conn():
-    """Get a PostgreSQL connection using .env credentials."""
-    return psycopg2.connect(
-        host=os.environ.get("DB_HOST", "localhost"),
-        port=int(os.environ.get("DB_PORT", 5432)),
-        dbname=os.environ.get("DB_NAME", "credit_reciept"),
-        user=os.environ.get("DB_USER", "postgres"),
-        password=os.environ.get("DB_PASSWORD", ""),
-    )
-
-
-def _init_db():
-    """Create tables if they don't exist (runs schema.sql)."""
-    schema_path = _SCRIPT_DIR / "db" / "schema.sql"
-    if not schema_path.exists():
-        return
-    sql = schema_path.read_text(encoding="utf-8")
-    try:
-        conn = _get_db_conn()
-        with conn:
-            conn.cursor().execute(sql)
-        conn.close()
-    except Exception as e:
-        st.sidebar.warning(f"DB init skipped: {e}")
-
-
-def db_store_receipt(file_name: str, file_data: bytes, vendor: str | None,
-                     amount: float | None, date_str: str | None,
-                     raw_text: str, confidence: float, status: str) -> int | None:
-    """Insert or update a receipt row. Returns receipt id."""
-    try:
-        conn = _get_db_conn()
-        with conn:
-            cur = conn.cursor()
-            # Upsert by file_name
-            cur.execute(
-                """INSERT INTO receipts (file_name, file_data, ocr_status,
-                        extracted_vendor, extracted_amount, extracted_date,
-                        raw_ocr_text, confidence)
-                   VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
-                   ON CONFLICT (file_name) DO UPDATE SET
-                        ocr_status = EXCLUDED.ocr_status,
-                        extracted_vendor = EXCLUDED.extracted_vendor,
-                        extracted_amount = EXCLUDED.extracted_amount,
-                        extracted_date = EXCLUDED.extracted_date,
-                        raw_ocr_text = EXCLUDED.raw_ocr_text,
-                        confidence = EXCLUDED.confidence
-                   RETURNING id""",
-                (file_name, psycopg2.Binary(file_data), status,
-                 vendor, amount, date_str, raw_text, confidence),
-            )
-            row = cur.fetchone()
-            rid = row[0] if row else None
-        conn.close()
-        return rid
-    except Exception:
-        return None
-
-
-def db_store_statement(file_name: str, file_data: bytes) -> int | None:
-    """Insert a statement row. Returns statement id."""
-    try:
-        conn = _get_db_conn()
-        with conn:
-            cur = conn.cursor()
-            cur.execute(
-                """INSERT INTO statements (file_name, file_data, ocr_status)
-                   VALUES (%s, %s, 'processed')
-                   ON CONFLICT (file_name) DO UPDATE SET ocr_status = 'processed'
-                   RETURNING id""",
-                (file_name, psycopg2.Binary(file_data)),
-            )
-            row = cur.fetchone()
-            sid = row[0] if row else None
-        conn.close()
-        return sid
-    except Exception:
-        return None
-
-
-def db_store_transactions(statement_id: int, df: pd.DataFrame):
-    """Insert parsed transactions linked to a statement."""
-    if statement_id is None or df.empty:
-        return
-    try:
-        conn = _get_db_conn()
-        with conn:
-            cur = conn.cursor()
-            # Clear old transactions for this statement
-            cur.execute("DELETE FROM transactions WHERE statement_id = %s", (statement_id,))
-            for idx, row in df.iterrows():
-                cur.execute(
-                    """INSERT INTO transactions
-                       (statement_id, transaction_date, description, amount,
-                        txn_type, row_index, confidence)
-                       VALUES (%s, %s, %s, %s, %s, %s, %s)""",
-                    (statement_id, row.get("date"), row.get("description"),
-                     row.get("amount"), row.get("type"), idx, row.get("confidence")),
-                )
-        conn.close()
-    except Exception:
-        pass
-
-
-def db_store_matches(df_matches: pd.DataFrame, receipt_id_map: dict, txn_id_map: dict):
-    """Insert match results into the matches table."""
-    if df_matches.empty:
-        return
-    try:
-        conn = _get_db_conn()
-        with conn:
-            cur = conn.cursor()
-            for _, row in df_matches.iterrows():
-                r_id = receipt_id_map.get(row.get("receipt_file"))
-                t_id = txn_id_map.get(row.get("stmt_description"))
-                if r_id and t_id:
-                    cur.execute(
-                        """INSERT INTO matches (receipt_id, transaction_id, confidence_score, status)
-                           VALUES (%s, %s, %s, %s)
-                           ON CONFLICT (receipt_id, transaction_id) DO UPDATE SET
-                              confidence_score = EXCLUDED.confidence_score,
-                              status = EXCLUDED.status""",
-                        (r_id, t_id, row.get("match_score"), row.get("status")),
-                    )
-        conn.close()
-    except Exception:
-        pass
-
-
-# Initialize DB tables on startup
-_init_db()
 
 # ---------------------------------------------------------------------------
 # Subprocess wrappers — each OCR engine runs in its own process to avoid
@@ -401,8 +266,7 @@ _SERVER_BOOT_ID = str(os.getpid()) + "_" + str(int(_time.time()))
 
 # Keys we persist: DataFrames are stored as JSON records, scalars as-is
 _PERSIST_DF_KEYS = ["df_receipts", "df_statements", "df_matches"]
-_PERSIST_SCALAR_KEYS = ["receipt_id_map", "statement_db_id",
-                        "_cached_statement_name", "debug_receipt_ocr",
+_PERSIST_SCALAR_KEYS = ["_cached_statement_name", "debug_receipt_ocr",
                         "selected_entity"]
 
 
@@ -1394,21 +1258,6 @@ if process_clicked:
             ).reset_index(drop=True)
         st.session_state["df_receipts"] = df_new
 
-        # Store receipts in PostgreSQL
-        receipt_id_map = {}
-        for _, rrow in df_new.iterrows():
-            fpath = UPLOAD_DIR_RECEIPTS / rrow["receipt_file"]
-            fdata = fpath.read_bytes() if fpath.exists() else b""
-            rid = db_store_receipt(
-                rrow["receipt_file"], fdata,
-                rrow.get("vendor"), rrow.get("amount"), rrow.get("date"),
-                rrow.get("raw_text", ""), rrow.get("confidence", 0.0),
-                rrow.get("status", "failed"),
-            )
-            if rid:
-                receipt_id_map[rrow["receipt_file"]] = rid
-        st.session_state["receipt_id_map"] = receipt_id_map
-
         st.sidebar.success(f"Step 1 done — {len(receipt_records)} receipt(s) processed")
         del receipt_records
         gc.collect()
@@ -1515,14 +1364,6 @@ if process_clicked:
             st.session_state["_cached_statement_name"] = _current_stmt_name
             _save_stmt_cache(_current_stmt_name, df_statements)
 
-            # Store statement + transactions in PostgreSQL
-            for sfile in statement_files:
-                fdata = sfile.read_bytes() if sfile.exists() else b""
-                sid = db_store_statement(sfile.name, fdata)
-                if sid:
-                    db_store_transactions(sid, df_statements)
-                    st.session_state["statement_db_id"] = sid
-
             st.sidebar.success(
                 f"Step 2 done — {len(df_statements)} transaction(s) validated"
             )
@@ -1551,23 +1392,6 @@ if process_clicked:
         n_auto = len(df_matches[df_matches["status"] == "auto_approved"])
         n_review = len(df_matches[df_matches["status"] == "review"])
         n_unmatched = len(df_matches[df_matches["match_score"] == 0])
-
-        # Store matches in PostgreSQL (best-effort)
-        r_id_map = st.session_state.get("receipt_id_map", {})
-        # Build transaction id map from DB
-        t_id_map = {}
-        try:
-            sid = st.session_state.get("statement_db_id")
-            if sid:
-                conn = _get_db_conn()
-                cur = conn.cursor()
-                cur.execute("SELECT id, description FROM transactions WHERE statement_id = %s", (sid,))
-                for row in cur.fetchall():
-                    t_id_map[row[1]] = row[0]
-                conn.close()
-        except Exception:
-            pass
-        db_store_matches(df_matches, r_id_map, t_id_map)
 
         st.sidebar.success(
             f"Step 3 done — {n_auto} auto-approved, {n_review} review, {n_unmatched} unmatched"
