@@ -140,7 +140,7 @@ def extract_receipt_data(image_path: str) -> dict:
     try:
         proc = subprocess.run(
             [sys.executable, _RECEIPT_WORKER, str(image_path)],
-            capture_output=True, text=True, timeout=120,
+            capture_output=True, text=True, timeout=300,
             cwd=str(_SCRIPT_DIR),
         )
         if proc.returncode != 0:
@@ -172,7 +172,7 @@ def extract_receipts_batch(image_paths: list[str], progress_callback=None) -> li
     ]
 
     cmd = [sys.executable, _RECEIPT_WORKER] + [str(p) for p in image_paths]
-    timeout = max(120, 30 * len(image_paths))  # 30s per receipt, min 2 min
+    timeout = max(300, 90 * len(image_paths))  # 90s per receipt, min 5 min
 
     try:
         proc = subprocess.Popen(
@@ -1235,22 +1235,20 @@ with st.sidebar:
 if process_clicked:
     # ── STEP 1: Process Receipts ──
     if receipt_files:
-        receipt_records = []
         progress = st.sidebar.progress(0, text="Step 1/2 — Processing receipts…")
-        for idx, rfile in enumerate(receipt_files):
-            try:
-                data = extract_receipt_data(str(rfile))
-            except Exception as e:
-                data = {
-                    "receipt_file": rfile.name,
-                    "vendor": None, "amount": None, "date": None,
-                    "raw_text": f"Error: {e}",
-                    "confidence": 0.0, "status": "failed",
-                }
-            receipt_records.append(data)
-            # Store per-receipt debug info
-            receipt_debug = st.session_state.setdefault("debug_receipt_ocr", {})
-            receipt_debug[data.get("receipt_file", str(rfile.name))] = {
+
+        def _receipt_progress(done, total):
+            progress.progress(done / total, text=f"Receipt {done}/{total}")
+
+        receipt_records = extract_receipts_batch(
+            [str(f) for f in receipt_files],
+            progress_callback=_receipt_progress,
+        )
+
+        # Store per-receipt debug info
+        receipt_debug = st.session_state.setdefault("debug_receipt_ocr", {})
+        for data in receipt_records:
+            receipt_debug[data.get("receipt_file", "")] = {
                 "raw_text": data.get("raw_text", ""),
                 "vendor": data.get("vendor"),
                 "amount": data.get("amount"),
@@ -1262,9 +1260,7 @@ if process_clicked:
                 "regex_amount": data.get("regex_amount"),
                 "regex_date": data.get("regex_date"),
             }
-            gc.collect()
-            progress.progress((idx + 1) / len(receipt_files),
-                              text=f"Receipt {idx + 1}/{len(receipt_files)}")
+        gc.collect()
         progress.empty()
 
         df_new = pd.DataFrame(receipt_records)
