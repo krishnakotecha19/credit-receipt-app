@@ -780,182 +780,36 @@ def parse_rows_fast(rows: list[str]) -> list[dict]:
     return transactions
 
 
-def call_qwen(rows: list[str]) -> list[dict]:
-    """Legacy: Send rows to Ollama Qwen for parsing. Kept for online pipeline.
-    For the offline pipeline, parse_rows_fast() is used instead."""
-    ollama_url = os.environ.get("OLLAMA_URL", "http://localhost:11434")
-    ollama_model = os.environ.get("OLLAMA_MODEL", "qwen2.5:3b")
-
-    all_transactions = []
-    debug_log = []
-    chunk_size = 20
-
-    st.session_state["qwen_input_rows"] = rows
-
-    for chunk_start in range(0, len(rows), chunk_size):
-        chunk = rows[chunk_start:chunk_start + chunk_size]
-
-        annotated_rows = []
-        for row_str in chunk:
-            segments = row_str.split(" | ")
-            hints = []
-            if len(segments) >= 1:
-                hints.append(f"[DATE_ZONE: {segments[0]}]")
-            if len(segments) >= 2:
-                hints.append(f"[DESC_ZONE: {segments[1]}]")
-            if len(segments) >= 3:
-                hints.append(f"[AMOUNT_ZONE: {segments[2]}]")
-            annotated_rows.append(f"{row_str}  // hints: {' '.join(hints)}")
-
-        rows_text = "\n".join(annotated_rows)
-
-        prompt = (
-            "You are an expert financial document parser.\n\n"
-            "Convert each row into JSON with fields:\n"
-            "- date (YYYY-MM-DD)\n"
-            "- description\n"
-            "- amount (float, always positive)\n\n"
-            "Rules:\n"
-            "- Dates must be normalized to YYYY-MM-DD (input is DD/MM/YYYY Indian format)\n"
-            "- Remove currency symbols and +/- signs from amounts\n"
-            "- Ignore invalid/header rows\n"
-            "- Each row has token hints after // showing which zone each part belongs to\n\n"
-            "Examples:\n"
-            'Input: "12/02/2026 | Amazon Pay | 1,200.00  // hints: [DATE_ZONE: 12/02/2026] '
-            '[DESC_ZONE: Amazon Pay] [AMOUNT_ZONE: 1,200.00]"\n'
-            'Output: {"date":"2026-02-12","description":"Amazon Pay","amount":1200.00}\n\n'
-            'Input: "13/02/2026 | Swiggy | +450.00  // hints: [DATE_ZONE: 13/02/2026] '
-            '[DESC_ZONE: Swiggy] [AMOUNT_ZONE: +450.00]"\n'
-            'Output: {"date":"2026-02-13","description":"Swiggy","amount":450.00}\n\n'
-            "Return ONLY a valid JSON array. No explanation.\n\n"
-            f"Now process these rows:\n{rows_text}"
-        )
-
-        parsed = None
-        last_raw = ""
-        error_msg = ""
-
-        for attempt in range(2):
-            try:
-                resp = requests.post(
-                    f"{ollama_url}/api/generate",
-                    json={
-                        "model": ollama_model,
-                        "prompt": prompt,
-                        "stream": False,
-                        "options": {"temperature": 0.1, "num_predict": 2000},
-                    },
-                    timeout=300,
-                )
-
-                if resp.status_code != 200:
-                    error_msg = f"Ollama error {resp.status_code}: {resp.text[:200]}"
-                    continue
-
-                raw_text = resp.json().get("response", "")
-                if not raw_text:
-                    error_msg = "Ollama returned empty response"
-                    continue
-
-                last_raw = raw_text
-
-                cleaned = raw_text.strip()
-                if cleaned.startswith("```"):
-                    cleaned = re.sub(r"^```(?:json)?\s*", "", cleaned)
-                    cleaned = re.sub(r"\s*```$", "", cleaned)
-
-                arr_match = re.search(r'\[.*\]', cleaned, re.DOTALL)
-                if arr_match:
-                    cleaned = arr_match.group(0)
-
-                parsed = json.loads(cleaned)
-                break
-            except (json.JSONDecodeError, KeyError, ValueError) as e:
-                error_msg = f"JSON parse error (attempt {attempt+1}): {e}\nRaw: {last_raw[:300]}"
-                continue
-            except requests.RequestException as e:
-                error_msg = f"Ollama connection error: {e}"
-                break
-
-        if parsed and isinstance(parsed, list):
-            for txn in parsed:
-                if isinstance(txn, dict) and "description" in txn:
-                    try:
-                        amt = float(txn.get("amount", 0))
-                    except (ValueError, TypeError):
-                        amt = 0.0
-                    all_transactions.append({
-                        "date": txn.get("date", ""),
-                        "description": txn.get("description", ""),
-                        "amount": amt,
-                        "type": txn.get("type", "debit"),
-                    })
-            debug_log.append({
-                "chunk": f"rows {chunk_start+1}-{chunk_start+len(chunk)}",
-                "status": "OK",
-                "parsed_count": len(parsed),
-            })
-        else:
-            debug_log.append({
-                "chunk": f"rows {chunk_start+1}-{chunk_start+len(chunk)}",
-                "status": "FAILED",
-                "error": error_msg[:300],
-            })
-
-    st.session_state["qwen_debug"] = debug_log
-    st.session_state["qwen_raw_output"] = all_transactions
-
-    return all_transactions
-
 
 def validate_and_store_transactions(
-    qwen_output: list[dict], ocr_row_confidences: list[float],
+    parsed_output: list[dict], ocr_row_confidences: list[float],
     original_rows: list[str] | None = None,
 ) -> pd.DataFrame:
-    """Validate Qwen-parsed transactions and compute hybrid confidence.
+    """Validate regex-parsed transactions and store as DataFrame.
 
-    Confidence = OCR confidence (50%) + LLM success (50%).
-    LLM success starts at 1.0 and is penalised for invalid fields.
-    Discards rows with final score < 0.2.
-
-    Also detects credit transactions by checking for a '+' prefix in the
-    amount zone of the original OCR row strings (fallback when Qwen
-    doesn't set type to 'credit').
+    parse_rows_fast() already handles date normalization, amount cleaning,
+    and credit detection via '+' prefix. This function validates fields
+    and assigns OCR confidence scores.
 
     Returns:
         DataFrame with columns: date, description, amount, type, confidence.
         Also stored in st.session_state['df_statements'].
     """
-    # Build credit row lookup from original rows.
-    # The '+' prefix is added by build_rows() via geometric welding.
-    # We store full row info (date fragment + amount) to match precisely
-    # against Qwen output, since index mapping is unreliable (Qwen
-    # may skip/merge/reorder rows).
-    _credit_rows: list[dict] = []
-    if original_rows:
-        for row_str in original_rows:
-            segments = row_str.split(" | ")
-            amount_seg = segments[-1].strip() if len(segments) >= 2 else ""
-            if amount_seg.startswith("+"):
-                date_seg = segments[0].strip() if segments else ""
-                amt_clean = amount_seg.lstrip("+").replace(",", "")
-                _credit_rows.append({"date_frag": date_seg, "amount": amt_clean})
-
     validated = []
     validation_debug = []
 
-    for idx, txn in enumerate(qwen_output):
-        # --- LLM success score ---
-        llm_success = 1.0
+    for idx, txn in enumerate(parsed_output):
         issues = []
 
         # Validate date
         date_val = txn.get("date", "")
-        try:
-            pd.to_datetime(date_val, format="%Y-%m-%d")
-        except (ValueError, TypeError):
-            llm_success -= 0.4
-            issues.append(f"bad date: {date_val!r}")
+        date_ok = False
+        if date_val:
+            try:
+                pd.to_datetime(date_val, format="%Y-%m-%d")
+                date_ok = True
+            except (ValueError, TypeError):
+                issues.append(f"bad date: {date_val!r}")
 
         # Validate amount
         amount_valid = True
@@ -963,84 +817,43 @@ def validate_and_store_transactions(
         try:
             amt = float(amt_val)
             if amt <= 0:
-                llm_success -= 0.5
                 amount_valid = False
                 issues.append(f"amount <= 0: {amt_val!r}")
         except (ValueError, TypeError):
-            llm_success -= 0.5
             amount_valid = False
             issues.append(f"bad amount: {amt_val!r}")
 
-        # --- OCR confidence (fall back to 0.5 if index out of range) ---
+        # OCR confidence
         ocr_conf = ocr_row_confidences[idx] if idx < len(ocr_row_confidences) else 0.5
 
-        # --- Hybrid score ---
-        final_score = (ocr_conf * 0.5) + (llm_success * 0.5)
+        # Score: penalize missing date or bad amount
+        score = ocr_conf
+        if not date_ok:
+            score *= 0.6
+        if not amount_valid:
+            score *= 0.3
 
-        # Track all rows for debug
         validation_debug.append({
             "idx": idx,
             "date": date_val,
             "desc": txn.get("description", "")[:40],
             "amount": amt_val,
             "type": txn.get("type", ""),
-            "llm_success": round(llm_success, 2),
             "ocr_conf": round(ocr_conf, 2),
-            "final_score": round(final_score, 2),
+            "final_score": round(score, 2),
             "issues": "; ".join(issues) if issues else "OK",
-            "kept": final_score >= 0.2,
+            "kept": score >= 0.15,
         })
 
-        # Discard rows that failed parsing badly
-        if final_score < 0.2:
+        if score < 0.15:
             continue
 
-        # Determine type: ONLY trust '+' prefix from geometric welding (OCR pixel
-        # probing). Ignore Qwen's credit/debit classification — it guesses wrong.
-        # Default everything to debit, override to credit only if '+' was found.
-        txn_type = "debit"
-        credit_flag = False
-
-        if _credit_rows:
-            try:
-                txn_amt_str = str(float(txn.get("amount", 0)))
-            except (ValueError, TypeError):
-                txn_amt_str = ""
-            txn_date_str = txn.get("date", "")
-            txn_date_parts = txn_date_str.replace("-", "")  # "20260127"
-
-            for cr in _credit_rows:
-                try:
-                    if abs(float(cr["amount"]) - float(txn_amt_str)) > 0.01:
-                        continue
-                except (ValueError, TypeError):
-                    continue
-                cr_digits = re.sub(r"[^\d]", "", cr["date_frag"])
-                if len(cr_digits) >= 4:
-                    dd_mm = cr_digits[:2] + cr_digits[2:4]
-                    mm_dd = cr_digits[2:4] + cr_digits[:2]
-                    if dd_mm in txn_date_parts or mm_dd in txn_date_parts:
-                        credit_flag = True
-                        break
-                else:
-                    credit_flag = True
-                    break
-
-        overridden = False
-        if credit_flag:
-            txn_type = "credit"
-            overridden = True
-
-        validation_debug[-1]["credit_flag"] = credit_flag
-        validation_debug[-1]["type_final"] = txn_type
-        validation_debug[-1]["type_overridden"] = overridden
-
         validated.append({
-            "date": txn.get("date", ""),
+            "date": date_val,
             "description": txn.get("description", ""),
-            "amount": float(txn.get("amount", 0)) if amount_valid else 0.0,
-            "type": txn_type,
-            "confidence": round(final_score, 4),
+            "amount": float(amt_val) if amount_valid else 0.0,
+            "type": txn.get("type", "debit"),
+            "confidence": round(score, 4),
         })
 
     st.session_state["validation_debug"] = validation_debug
@@ -2637,7 +2450,7 @@ with tab_compare:
             df_raw = pd.DataFrame(_qwen_raw)
             st.dataframe(df_raw, width="stretch", hide_index=True)
     elif _qwen_rows:
-        st.error("LLM returned 0 transactions. Check that Ollama is running: ollama serve")
+        st.error("Parser returned 0 transactions. Check OCR debug output for row reconstruction issues.")
 
     # Debug 4: Validation results (what was kept/rejected and why)
     _val_debug = st.session_state.get("validation_debug")
