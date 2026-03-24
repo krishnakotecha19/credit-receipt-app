@@ -130,7 +130,8 @@ def _load_image_fixed(path: Path) -> Image.Image:
 # ---------------------------------------------------------------------------
 
 def extract_receipt_data(image_path: str) -> dict:
-    """Run PaddleOCR receipt extraction in a subprocess (single-receipt mode)."""
+    """Run VLM receipt extraction in a subprocess (single-receipt mode).
+    Falls back to PaddleOCR + regex if VLM is unavailable."""
     fallback = {
         "receipt_file": os.path.basename(image_path),
         "vendor": None, "amount": None, "date": None,
@@ -152,10 +153,10 @@ def extract_receipt_data(image_path: str) -> dict:
 
 
 def extract_receipts_batch(image_paths: list[str], progress_callback=None) -> list[dict]:
-    """Run PaddleOCR on ALL receipts in ONE subprocess (batch mode).
+    """Run VLM receipt extraction on ALL receipts in ONE subprocess (batch mode).
 
-    Loads the model once and processes all images sequentially inside a
-    single subprocess — avoids the ~2-3s model-load overhead per receipt.
+    VLM reads images directly — no OCR model loading needed.
+    Falls back to PaddleOCR + regex per-receipt if VLM is unavailable.
     Reads PROGRESS:<n>/<total> lines from stderr to drive a progress bar.
     """
     if not image_paths:
@@ -356,10 +357,14 @@ def build_rows(ocr_pages: list[dict]) -> tuple[list[str], list[float]]:
         Tuple of (row_strings, ocr_confidences) where ocr_confidences[i] is the
         average OCR confidence for words in row_strings[i].
     """
-    _HEADER_WORDS = {"statement", "page", "total", "balance", "opening", "closing",
-                      "transaction", "description", "amount", "domestic",
-                      "international", "offers", "explore", "credit card",
-                      "gstin", "hsn"}
+    # Header words that ALWAYS indicate a non-transaction row
+    _HEADER_ALWAYS = {"statement", "page", "opening", "closing",
+                       "description", "offers", "explore", "credit card",
+                       "gstin", "hsn"}
+    # Words that are header-like ONLY when the row has NO date pattern
+    # (e.g. "International Transactions" header vs "AMAZON INTERNATIONAL 5432.00")
+    _HEADER_IF_NO_DATE = {"total", "balance", "transaction", "amount",
+                           "domestic", "international"}
     # Date patterns: DD/MM/YYYY, DD-MM-YYYY, YYYY-MM-DD, DD MMM YYYY, DD/MM/YY
     _DATE_RE = re.compile(
         r"\d{2}[/\-]\d{2}[/\-]\d{2,4}"       # DD/MM/YYYY or DD-MM-YY
@@ -443,7 +448,11 @@ def build_rows(ocr_pages: list[dict]) -> tuple[list[str], list[float]]:
             # Check for header/junk rows — skip them, but first scan
             # for column layout clues (debit/credit column positions)
             row_text_lower = " ".join(w["text"].lower() for w in row_words)
-            if any(hw in row_text_lower for hw in _HEADER_WORDS):
+            row_has_date = bool(_DATE_RE.search(row_text_lower))
+            is_always_header = any(hw in row_text_lower for hw in _HEADER_ALWAYS)
+            is_conditional_header = (not row_has_date and
+                                     any(hw in row_text_lower for hw in _HEADER_IF_NO_DATE))
+            if is_always_header or is_conditional_header:
                 # Look for "cr" / "credit" column header to learn the credit X zone
                 for w in row_words:
                     wt = w["text"].lower().strip()

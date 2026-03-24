@@ -808,7 +808,24 @@ def extract_receipt_data(image_path: str) -> dict:
         "status": "failed",
     }
 
-    # ── Attempt 1: normal preprocessing (EXIF rotation + resize) ──
+    # ── Primary: VLM extracts directly from the receipt image ──
+    # No OCR needed — the vision-language model reads the image itself.
+    llm = _extract_via_llm(image_path, "")
+    if llm:
+        print(f"VLM result: {llm}", file=sys.stderr)
+        result.update({
+            "vendor": llm.get("vendor"),
+            "amount": llm.get("amount"),
+            "date": llm.get("date"),
+            "confidence": 0.95,
+            "status": "success",
+            "llm_raw": llm,
+        })
+        return result
+
+    # ── Fallback: PaddleOCR + regex if VLM is unavailable ──
+    print("VLM unavailable, falling back to OCR + regex", file=sys.stderr)
+
     try:
         processed_img = preprocess_image(image_path)
     except ValueError:
@@ -817,9 +834,7 @@ def extract_receipt_data(image_path: str) -> dict:
     texts, scores = _run_ocr_on_image(processed_img)
     avg_conf = sum(scores) / len(scores) if scores else 0.0
 
-    # ── Attempt 2: if OCR looks like garbage, try WITHOUT EXIF rotation.
-    #    Some images (WhatsApp forwards etc.) have stale EXIF orientation
-    #    tags that flip the image upside-down, producing garbage OCR. ──
+    # Retry WITHOUT EXIF rotation if OCR looks like garbage
     if not _ocr_quality_ok(texts, avg_conf):
         try:
             img_raw = cv2.imread(image_path)
@@ -838,27 +853,9 @@ def extract_receipt_data(image_path: str) -> dict:
     lines = list(texts)
     full_text = "\n".join(lines)
 
-    # ── Regex-based extraction (fast, works for most receipts) ──
     extracted_date = _parse_date_from_all_lines(lines)
     extracted_amount = _parse_amount(lines)
     extracted_vendor = _extract_vendor(lines)
-
-    # ── Local LLM extraction via Ollama — primary source ──
-    regex_vendor = extracted_vendor
-    regex_amount = extracted_amount
-    regex_date = extracted_date
-
-    llm = _extract_via_llm(image_path, full_text)
-    if llm:
-        print(f"LLM result: {llm}", file=sys.stderr)
-        if llm.get("vendor"):
-            extracted_vendor = llm["vendor"]
-        if llm.get("amount") is not None:
-            extracted_amount = llm["amount"]
-        if llm.get("date"):
-            extracted_date = llm["date"]
-    else:
-        print("LLM returned None — using regex results", file=sys.stderr)
 
     result.update({
         "vendor": extracted_vendor,
@@ -867,10 +864,9 @@ def extract_receipt_data(image_path: str) -> dict:
         "raw_text": full_text,
         "confidence": round(avg_conf, 4),
         "status": "success",
-        "llm_raw": llm,
-        "regex_vendor": regex_vendor,
-        "regex_amount": regex_amount,
-        "regex_date": regex_date,
+        "regex_vendor": extracted_vendor,
+        "regex_amount": extracted_amount,
+        "regex_date": extracted_date,
     })
     return result
 
@@ -887,10 +883,9 @@ if __name__ == "__main__":
         data = extract_receipt_data(image_paths[0])
         print(json.dumps(data, ensure_ascii=False))
     else:
-        # ── Batch mode: load model ONCE, process ALL receipts ──
-        # Pre-warm the OCR engine before the loop so model loading is
-        # paid only once instead of N times.
-        _get_ocr()
+        # ── Batch mode: process ALL receipts ──
+        # VLM is primary — no need to pre-warm PaddleOCR.
+        # OCR engine is only loaded on-demand if VLM is unavailable.
         results = []
         for path in image_paths:
             try:
