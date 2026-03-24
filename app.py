@@ -673,17 +673,116 @@ def build_rows(ocr_pages: list[dict]) -> tuple[list[str], list[float]]:
     return merged_rows, merged_confs
 
 
-def call_qwen(rows: list[str]) -> list[dict]:
-    """Send reconstructed rows to local Qwen2.5-3B (via Ollama) for semantic
-    parsing into structured transactions. Fully offline.
+def _normalize_date(date_str: str) -> str:
+    """Convert DD/MM/YYYY, DD-MM-YYYY, DD/MM/YY etc. to YYYY-MM-DD.
+    Returns empty string if unparseable."""
+    date_str = date_str.strip()
+    if not date_str:
+        return ""
 
-    Args:
-        rows: Output from build_rows().
+    # DD/MM/YYYY or DD-MM-YYYY or DD/MM/YY
+    m = re.match(r"(\d{1,2})[/\-](\d{1,2})[/\-](\d{2,4})$", date_str)
+    if m:
+        dd, mm, yy = int(m.group(1)), int(m.group(2)), int(m.group(3))
+        if yy < 100:
+            yy += 2000
+        if 1 <= mm <= 12 and 1 <= dd <= 31 and 2020 <= yy <= 2030:
+            return f"{yy:04d}-{mm:02d}-{dd:02d}"
+        # Maybe MM/DD/YYYY — try swapping if dd > 12
+        if dd > 12 and 1 <= mm <= 31 and 1 <= dd <= 12:
+            return f"{yy:04d}-{dd:02d}-{mm:02d}"
+        return ""
+
+    # YYYY-MM-DD (already correct)
+    m = re.match(r"(\d{4})[/\-](\d{1,2})[/\-](\d{1,2})$", date_str)
+    if m:
+        yy, mm, dd = int(m.group(1)), int(m.group(2)), int(m.group(3))
+        if 2020 <= yy <= 2030 and 1 <= mm <= 12 and 1 <= dd <= 31:
+            return f"{yy:04d}-{mm:02d}-{dd:02d}"
+        return ""
+
+    # DD MMM YYYY / MMM DD, YYYY (e.g. "19 Jan 2026", "Jan 19, 2026")
+    try:
+        dt = dateutil_parser.parse(date_str, dayfirst=True)
+        if 2020 <= dt.year <= 2030:
+            return dt.strftime("%Y-%m-%d")
+    except (ValueError, OverflowError, TypeError):
+        pass
+
+    return ""
+
+
+def parse_rows_fast(rows: list[str]) -> list[dict]:
+    """Parse build_rows output into structured transactions using regex.
+
+    build_rows already outputs "date | description | amount" strings.
+    This just normalizes dates, cleans amounts, and detects credits.
+    Zero LLM calls — runs in milliseconds.
 
     Returns:
-        List of dicts with keys: date (str), description (str),
-        amount (float), type ('debit' | 'credit').
+        List of dicts with keys: date, description, amount, type.
     """
+    transactions = []
+    debug_log = []
+
+    st.session_state["qwen_input_rows"] = rows
+
+    for row_str in rows:
+        segments = [s.strip() for s in row_str.split(" | ")]
+
+        if len(segments) < 2:
+            debug_log.append({"row": row_str[:60], "status": "SKIP (too few segments)"})
+            continue
+
+        # Extract parts based on segment count
+        date_raw = segments[0] if len(segments) >= 1 else ""
+        desc_raw = segments[1] if len(segments) >= 2 else ""
+        amount_raw = segments[-1] if len(segments) >= 3 else ""
+
+        # If only 2 segments, second could be amount or description
+        if len(segments) == 2:
+            if re.match(r"^[+\-]?\d[\d,]*\.?\d*$", segments[1].strip()):
+                amount_raw = segments[1]
+                desc_raw = ""
+            else:
+                desc_raw = segments[1]
+                amount_raw = ""
+
+        # Normalize date: DD/MM/YYYY → YYYY-MM-DD
+        date_normalized = _normalize_date(date_raw)
+
+        # Clean amount: remove ₹, commas; detect credit via '+' prefix
+        is_credit = amount_raw.startswith("+")
+        amount_clean = amount_raw.lstrip("+-").replace(",", "").replace("₹", "").strip()
+        try:
+            amount_val = float(amount_clean) if amount_clean else 0.0
+        except ValueError:
+            amount_val = 0.0
+
+        # Skip rows with no usable data
+        if not date_normalized and amount_val <= 0:
+            debug_log.append({"row": row_str[:60], "status": "SKIP (no date + no amount)"})
+            continue
+
+        txn_type = "credit" if is_credit else "debit"
+
+        transactions.append({
+            "date": date_normalized,
+            "description": desc_raw,
+            "amount": amount_val,
+            "type": txn_type,
+        })
+        debug_log.append({"row": row_str[:60], "status": "OK"})
+
+    st.session_state["qwen_debug"] = debug_log
+    st.session_state["qwen_raw_output"] = transactions
+
+    return transactions
+
+
+def call_qwen(rows: list[str]) -> list[dict]:
+    """Legacy: Send rows to Ollama Qwen for parsing. Kept for online pipeline.
+    For the offline pipeline, parse_rows_fast() is used instead."""
     ollama_url = os.environ.get("OLLAMA_URL", "http://localhost:11434")
     ollama_model = os.environ.get("OLLAMA_MODEL", "qwen2.5:3b")
 
@@ -691,13 +790,11 @@ def call_qwen(rows: list[str]) -> list[dict]:
     debug_log = []
     chunk_size = 20
 
-    # Store the raw rows being sent for debugging
     st.session_state["qwen_input_rows"] = rows
 
     for chunk_start in range(0, len(rows), chunk_size):
         chunk = rows[chunk_start:chunk_start + chunk_size]
 
-        # Build row strings with optional token-level hints for difficult rows
         annotated_rows = []
         for row_str in chunk:
             segments = row_str.split(" | ")
@@ -724,9 +821,11 @@ def call_qwen(rows: list[str]) -> list[dict]:
             "- Ignore invalid/header rows\n"
             "- Each row has token hints after // showing which zone each part belongs to\n\n"
             "Examples:\n"
-            'Input: "12/02/2026 | Amazon Pay | 1,200.00  // hints: [DATE_ZONE: 12/02/2026] [DESC_ZONE: Amazon Pay] [AMOUNT_ZONE: 1,200.00]"\n'
+            'Input: "12/02/2026 | Amazon Pay | 1,200.00  // hints: [DATE_ZONE: 12/02/2026] '
+            '[DESC_ZONE: Amazon Pay] [AMOUNT_ZONE: 1,200.00]"\n'
             'Output: {"date":"2026-02-12","description":"Amazon Pay","amount":1200.00}\n\n'
-            'Input: "13/02/2026 | Swiggy | +450.00  // hints: [DATE_ZONE: 13/02/2026] [DESC_ZONE: Swiggy] [AMOUNT_ZONE: +450.00]"\n'
+            'Input: "13/02/2026 | Swiggy | +450.00  // hints: [DATE_ZONE: 13/02/2026] '
+            '[DESC_ZONE: Swiggy] [AMOUNT_ZONE: +450.00]"\n'
             'Output: {"date":"2026-02-13","description":"Swiggy","amount":450.00}\n\n'
             "Return ONLY a valid JSON array. No explanation.\n\n"
             f"Now process these rows:\n{rows_text}"
@@ -736,7 +835,7 @@ def call_qwen(rows: list[str]) -> list[dict]:
         last_raw = ""
         error_msg = ""
 
-        for attempt in range(3):
+        for attempt in range(2):
             try:
                 resp = requests.post(
                     f"{ollama_url}/api/generate",
@@ -760,13 +859,11 @@ def call_qwen(rows: list[str]) -> list[dict]:
 
                 last_raw = raw_text
 
-                # Strip markdown code fences if present
                 cleaned = raw_text.strip()
                 if cleaned.startswith("```"):
                     cleaned = re.sub(r"^```(?:json)?\s*", "", cleaned)
                     cleaned = re.sub(r"\s*```$", "", cleaned)
 
-                # Extract JSON array
                 arr_match = re.search(r'\[.*\]', cleaned, re.DOTALL)
                 if arr_match:
                     cleaned = arr_match.group(0)
@@ -775,12 +872,6 @@ def call_qwen(rows: list[str]) -> list[dict]:
                 break
             except (json.JSONDecodeError, KeyError, ValueError) as e:
                 error_msg = f"JSON parse error (attempt {attempt+1}): {e}\nRaw: {last_raw[:300]}"
-                if last_raw:
-                    prompt = (
-                        "The following output is not valid JSON. "
-                        "Fix it and return ONLY a valid JSON array:\n\n"
-                        f"{last_raw}"
-                    )
                 continue
             except requests.RequestException as e:
                 error_msg = f"Ollama connection error: {e}"
@@ -803,17 +894,14 @@ def call_qwen(rows: list[str]) -> list[dict]:
                 "chunk": f"rows {chunk_start+1}-{chunk_start+len(chunk)}",
                 "status": "OK",
                 "parsed_count": len(parsed),
-                "sample": str(parsed[:2])[:200] if parsed else "",
             })
         else:
             debug_log.append({
                 "chunk": f"rows {chunk_start+1}-{chunk_start+len(chunk)}",
                 "status": "FAILED",
                 "error": error_msg[:300],
-                "raw_response": last_raw[:300],
             })
 
-    # Store debug log for UI display
     st.session_state["qwen_debug"] = debug_log
     st.session_state["qwen_raw_output"] = all_transactions
 
@@ -1678,17 +1766,17 @@ if process_clicked:
             st.sidebar.warning("  → 0 rows with +/CR found in OCR output")
 
         if rows:
-            # Step 2c: Send rows to Qwen for parsing
-            st.sidebar.info(f"Step 2c — Sending {len(rows)} rows to Qwen…")
-            qwen_output = call_qwen(rows)
+            # Step 2c: Parse rows into structured transactions (fast regex — no LLM)
+            st.sidebar.info(f"Step 2c — Parsing {len(rows)} rows…")
+            qwen_output = parse_rows_fast(rows)
 
-            # DEBUG: Show what types Qwen returned
+            # DEBUG: Show credit/debit breakdown
             qwen_credits = [
                 (i, t.get("description", "")[:30], t.get("amount"), t.get("type"))
                 for i, t in enumerate(qwen_output) if t.get("type", "").lower() == "credit"
             ]
             st.session_state["debug_qwen_credits"] = qwen_credits
-            st.sidebar.caption(f"  → Qwen returned {len(qwen_credits)} credit(s) out of {len(qwen_output)} txns")
+            st.sidebar.caption(f"  → Parsed {len(qwen_output)} txns ({len(qwen_credits)} credits)")
 
             # Step 2d: Validate and compute hybrid confidence scores
             st.sidebar.info("Step 2d — Validating transactions…")
