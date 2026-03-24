@@ -401,6 +401,7 @@ def build_rows(ocr_pages: list[dict]) -> tuple[list[str], list[float]]:
     )
     all_rows = []
     all_confs = []
+    _current_section = "domestic"  # track domestic/international across pages
 
     for page_data in ocr_pages:
         if page_data["status"] != "success":
@@ -497,7 +498,25 @@ def build_rows(ocr_pages: list[dict]) -> tuple[list[str], list[float]]:
             is_conditional_header = (not row_has_date and
                                      any(hw in row_text_lower for hw in _HEADER_IF_NO_DATE))
             is_section_divider = bool(_SECTION_DIVIDER_RE.match(row_text_lower.strip()))
-            if is_always_header or is_conditional_header or is_section_divider:
+
+            # Track section changes — emit marker row so parser knows
+            if is_section_divider:
+                if "international" in row_text_lower:
+                    _current_section = "international"
+                else:
+                    _current_section = "domestic"
+                all_rows.append(f"__SECTION__{_current_section}")
+                all_confs.append(1.0)
+                if _is_first_page and len(_row_word_debug) < 40:
+                    _row_word_debug.append({
+                        "row": row_idx_in_page,
+                        "status": f"SECTION → {_current_section}",
+                        "raw_text": row_text_lower[:80],
+                        "words": [],
+                    })
+                continue
+
+            if is_always_header or is_conditional_header:
                 # Look for "cr" / "credit" column header to learn the credit X zone
                 for w in row_words:
                     wt = w["text"].lower().strip()
@@ -712,20 +731,12 @@ def _normalize_date(date_str: str) -> str:
     return ""
 
 
-# Regex: extract amount — look for ₹ or Rs or plain number, capture up to 2 decimals
-# '+' before the ₹/number means credit
-_STMT_AMOUNT_RE = re.compile(
-    r"(\+)?\s*(?:[₹]|Rs\.?\s*)?"          # optional '+' sign, optional ₹/Rs prefix
-    r"(\d[\d,]*\.\d{2})"                   # digits with commas, exactly 2 decimal places
-)
-
-
 def parse_rows_fast(rows: list[str]) -> list[dict]:
     """Parse build_rows output into structured transactions using regex.
 
-    Section-aware: tracks domestic/international sections from row content.
-    Detects credits via '+' prefix before the amount.
-    Amounts are parsed up to 2 decimal places, ₹ sign stripped.
+    Section-aware: build_rows emits __SECTION__domestic / __SECTION__international
+    markers. Credits detected via '+' prefix on amount.
+    Amount: any digits (with optional commas), optional decimal — truncated to 2dp.
     Zero LLM calls — runs in milliseconds.
 
     Returns:
@@ -733,22 +744,15 @@ def parse_rows_fast(rows: list[str]) -> list[dict]:
     """
     transactions = []
     debug_log = []
-    current_section = "domestic"  # default until we see a section header
+    current_section = "domestic"
 
     st.session_state["qwen_input_rows"] = rows
 
     for row_str in rows:
-        row_lower = row_str.lower()
-
-        # Detect section headers (these come through as rows even if build_rows
-        # didn't skip them — belt and suspenders)
-        if re.search(r"international\s+transaction", row_lower):
-            current_section = "international"
-            debug_log.append({"row": row_str[:60], "status": "SECTION → international"})
-            continue
-        if re.search(r"domestic\s+transaction", row_lower):
-            current_section = "domestic"
-            debug_log.append({"row": row_str[:60], "status": "SECTION → domestic"})
+        # Section markers from build_rows
+        if row_str.startswith("__SECTION__"):
+            current_section = row_str.replace("__SECTION__", "")
+            debug_log.append({"row": row_str, "status": f"SECTION → {current_section}"})
             continue
 
         segments = [s.strip() for s in row_str.split(" | ")]
@@ -757,48 +761,38 @@ def parse_rows_fast(rows: list[str]) -> list[dict]:
             debug_log.append({"row": row_str[:60], "status": "SKIP (too few segments)"})
             continue
 
-        # Extract parts based on segment count
+        # Extract parts
         date_raw = segments[0]
         desc_raw = segments[1] if len(segments) >= 2 else ""
         amount_raw = segments[-1] if len(segments) >= 3 else ""
 
-        # If only 2 segments, second could be amount or description
+        # If only 2 segments, check if second is an amount
         if len(segments) == 2:
-            if re.match(r"^[+\-]?\s*(?:[₹]|Rs\.?\s*)?\d[\d,]*\.\d{2}$", segments[1].strip()):
+            if re.match(r"^[+\-]?\d[\d,]*\.?\d*$", segments[1].strip()):
                 amount_raw = segments[1]
                 desc_raw = ""
             else:
                 desc_raw = segments[1]
                 amount_raw = ""
 
-        # Normalize date: DD/MM/YYYY → YYYY-MM-DD
+        # Normalize date
         date_normalized = _normalize_date(date_raw)
 
-        # Parse amount: look for +₹1,234.56 pattern, strip ₹, keep 2 decimals
-        is_credit = False
-        amount_val = 0.0
+        # Parse amount — simple: strip +, ₹, Rs, commas → float → round to 2dp
+        is_credit = "+" in amount_raw.split(".")[0]  # '+' anywhere before decimal
+        amount_clean = amount_raw.replace("+", "").replace("-", "")
+        amount_clean = amount_clean.replace("₹", "").replace("Rs.", "").replace("Rs", "")
+        amount_clean = amount_clean.replace(",", "").strip()
 
-        amt_match = _STMT_AMOUNT_RE.search(amount_raw)
-        if amt_match:
-            is_credit = amt_match.group(1) == "+"
-            amount_clean = amt_match.group(2).replace(",", "")
+        # Extract the numeric part — digits with optional decimal
+        num_match = re.search(r"(\d+\.?\d*)", amount_clean)
+        if num_match:
             try:
-                amount_val = float(amount_clean)
+                amount_val = round(float(num_match.group(1)), 2)
             except ValueError:
                 amount_val = 0.0
         else:
-            # Fallback: try cleaning the entire amount segment
-            cleaned = amount_raw.lstrip("+-").replace(",", "").replace("₹", "").strip()
-            # Remove anything after 2 decimal places
-            dec_match = re.match(r"(\d+\.\d{2})", cleaned)
-            if dec_match:
-                cleaned = dec_match.group(1)
-            if amount_raw.startswith("+"):
-                is_credit = True
-            try:
-                amount_val = float(cleaned) if cleaned else 0.0
-            except ValueError:
-                amount_val = 0.0
+            amount_val = 0.0
 
         # Skip rows with no usable data
         if not date_normalized and amount_val <= 0:
