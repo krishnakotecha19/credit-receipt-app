@@ -712,22 +712,45 @@ def _normalize_date(date_str: str) -> str:
     return ""
 
 
+# Regex: extract amount — look for ₹ or Rs or plain number, capture up to 2 decimals
+# '+' before the ₹/number means credit
+_STMT_AMOUNT_RE = re.compile(
+    r"(\+)?\s*(?:[₹]|Rs\.?\s*)?"          # optional '+' sign, optional ₹/Rs prefix
+    r"(\d[\d,]*\.\d{2})"                   # digits with commas, exactly 2 decimal places
+)
+
+
 def parse_rows_fast(rows: list[str]) -> list[dict]:
     """Parse build_rows output into structured transactions using regex.
 
-    build_rows already outputs "date | description | amount" strings.
-    This just normalizes dates, cleans amounts, and detects credits.
+    Section-aware: tracks domestic/international sections from row content.
+    Detects credits via '+' prefix before the amount.
+    Amounts are parsed up to 2 decimal places, ₹ sign stripped.
     Zero LLM calls — runs in milliseconds.
 
     Returns:
-        List of dicts with keys: date, description, amount, type.
+        List of dicts with keys: date, description, amount, type, section.
     """
     transactions = []
     debug_log = []
+    current_section = "domestic"  # default until we see a section header
 
     st.session_state["qwen_input_rows"] = rows
 
     for row_str in rows:
+        row_lower = row_str.lower()
+
+        # Detect section headers (these come through as rows even if build_rows
+        # didn't skip them — belt and suspenders)
+        if re.search(r"international\s+transaction", row_lower):
+            current_section = "international"
+            debug_log.append({"row": row_str[:60], "status": "SECTION → international"})
+            continue
+        if re.search(r"domestic\s+transaction", row_lower):
+            current_section = "domestic"
+            debug_log.append({"row": row_str[:60], "status": "SECTION → domestic"})
+            continue
+
         segments = [s.strip() for s in row_str.split(" | ")]
 
         if len(segments) < 2:
@@ -735,13 +758,13 @@ def parse_rows_fast(rows: list[str]) -> list[dict]:
             continue
 
         # Extract parts based on segment count
-        date_raw = segments[0] if len(segments) >= 1 else ""
+        date_raw = segments[0]
         desc_raw = segments[1] if len(segments) >= 2 else ""
         amount_raw = segments[-1] if len(segments) >= 3 else ""
 
         # If only 2 segments, second could be amount or description
         if len(segments) == 2:
-            if re.match(r"^[+\-]?\d[\d,]*\.?\d*$", segments[1].strip()):
+            if re.match(r"^[+\-]?\s*(?:[₹]|Rs\.?\s*)?\d[\d,]*\.\d{2}$", segments[1].strip()):
                 amount_raw = segments[1]
                 desc_raw = ""
             else:
@@ -751,13 +774,31 @@ def parse_rows_fast(rows: list[str]) -> list[dict]:
         # Normalize date: DD/MM/YYYY → YYYY-MM-DD
         date_normalized = _normalize_date(date_raw)
 
-        # Clean amount: remove ₹, commas; detect credit via '+' prefix
-        is_credit = amount_raw.startswith("+")
-        amount_clean = amount_raw.lstrip("+-").replace(",", "").replace("₹", "").strip()
-        try:
-            amount_val = float(amount_clean) if amount_clean else 0.0
-        except ValueError:
-            amount_val = 0.0
+        # Parse amount: look for +₹1,234.56 pattern, strip ₹, keep 2 decimals
+        is_credit = False
+        amount_val = 0.0
+
+        amt_match = _STMT_AMOUNT_RE.search(amount_raw)
+        if amt_match:
+            is_credit = amt_match.group(1) == "+"
+            amount_clean = amt_match.group(2).replace(",", "")
+            try:
+                amount_val = float(amount_clean)
+            except ValueError:
+                amount_val = 0.0
+        else:
+            # Fallback: try cleaning the entire amount segment
+            cleaned = amount_raw.lstrip("+-").replace(",", "").replace("₹", "").strip()
+            # Remove anything after 2 decimal places
+            dec_match = re.match(r"(\d+\.\d{2})", cleaned)
+            if dec_match:
+                cleaned = dec_match.group(1)
+            if amount_raw.startswith("+"):
+                is_credit = True
+            try:
+                amount_val = float(cleaned) if cleaned else 0.0
+            except ValueError:
+                amount_val = 0.0
 
         # Skip rows with no usable data
         if not date_normalized and amount_val <= 0:
@@ -771,8 +812,9 @@ def parse_rows_fast(rows: list[str]) -> list[dict]:
             "description": desc_raw,
             "amount": amount_val,
             "type": txn_type,
+            "section": current_section,
         })
-        debug_log.append({"row": row_str[:60], "status": "OK"})
+        debug_log.append({"row": row_str[:60], "status": f"OK [{current_section}]"})
 
     st.session_state["qwen_debug"] = debug_log
     st.session_state["qwen_raw_output"] = transactions
@@ -853,6 +895,7 @@ def validate_and_store_transactions(
             "description": txn.get("description", ""),
             "amount": float(amt_val) if amount_valid else 0.0,
             "type": txn.get("type", "debit"),
+            "section": txn.get("section", "domestic"),
             "confidence": round(score, 4),
         })
 
@@ -860,7 +903,7 @@ def validate_and_store_transactions(
 
     df = pd.DataFrame(
         validated,
-        columns=["date", "description", "amount", "type", "confidence"],
+        columns=["date", "description", "amount", "type", "section", "confidence"],
     )
 
     st.session_state["df_statements"] = df
@@ -2429,24 +2472,23 @@ with tab_compare:
             for i, r in enumerate(_qwen_rows):
                 st.text(f"  [{i:2d}] {r}")
 
-    # Debug 2: LLM (Ollama) response status
+    # Debug 2: Row parse status
     _qwen_debug = st.session_state.get("qwen_debug")
     if _qwen_debug:
-        with st.expander("2. LLM (Qwen2.5-3B) Response Status", expanded=True):
+        with st.expander("2. Row Parse Status", expanded=True):
+            n_ok = sum(1 for e in _qwen_debug if e.get("status") == "OK")
+            n_skip = len(_qwen_debug) - n_ok
+            st.caption(f"{n_ok} parsed, {n_skip} skipped")
             for entry in _qwen_debug:
-                if entry["status"] == "OK":
-                    st.success(f"**{entry['chunk']}**: Parsed {entry['parsed_count']} transactions")
-                    st.caption(f"Sample: {entry.get('sample', '')}")
+                if entry.get("status") == "OK":
+                    st.success(f"{entry.get('row', '?')}")
                 else:
-                    st.error(f"**{entry['chunk']}**: FAILED")
-                    st.code(entry.get("error", "unknown error"), language=None)
-                    if entry.get("raw_response"):
-                        st.code(f"Raw response:\n{entry['raw_response']}", language=None)
+                    st.warning(f"{entry.get('row', '?')} — {entry.get('status', 'SKIP')}")
 
-    # Debug 3: LLM raw output (before validation)
+    # Debug 3: Parsed output (before validation)
     _qwen_raw = st.session_state.get("qwen_raw_output")
     if _qwen_raw:
-        with st.expander(f"3. LLM Raw Output ({len(_qwen_raw)} transactions before validation)", expanded=False):
+        with st.expander(f"3. Parsed Output ({len(_qwen_raw)} transactions before validation)", expanded=False):
             df_raw = pd.DataFrame(_qwen_raw)
             st.dataframe(df_raw, width="stretch", hide_index=True)
     elif _qwen_rows:
