@@ -827,9 +827,16 @@ def extract_receipt_data(image_path: str) -> dict:
             "vendor": llm.get("vendor"),
             "amount": llm.get("amount"),
             "date": llm.get("date"),
+            "raw_text": f"[VLM direct extraction — no OCR]\n"
+                        f"Vendor: {llm.get('vendor')}\n"
+                        f"Amount: {llm.get('amount')}\n"
+                        f"Date: {llm.get('date')}",
             "confidence": 0.95,
             "status": "success",
             "llm_raw": llm,
+            "regex_vendor": None,
+            "regex_amount": None,
+            "regex_date": None,
         })
         return result
 

@@ -2157,12 +2157,16 @@ with tab_ocr_debug:
 
             with col_ocr:
                 raw_text = dbg.get("raw_text", "")
+                is_vlm = raw_text.startswith("[VLM direct")
                 # Show line count
                 line_count = len(raw_text.split("\n")) if raw_text else 0
-                st.caption(f"{line_count} OCR text lines")
+                if is_vlm:
+                    st.caption("VLM direct extraction (no OCR used)")
+                else:
+                    st.caption(f"{line_count} OCR text lines")
 
                 st.text_area(
-                    "Raw OCR Output",
+                    "Raw Output",
                     value=raw_text,
                     height=400,
                     key=f"ocr_debug_{receipt_name}",
