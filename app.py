@@ -552,7 +552,7 @@ def build_rows(ocr_pages: list[dict]) -> tuple[list[str], list[float]]:
                     row_is_credit = True
                     break
 
-            # If credit detected, prepend '+' so downstream (Gemini + validation) can see it
+            # If credit detected, prepend '+' so downstream (Qwen + validation) can see it
             if row_is_credit and amount_str and not amount_str.startswith("+"):
                 amount_str = "+" + amount_str
 
@@ -628,8 +628,8 @@ def build_rows(ocr_pages: list[dict]) -> tuple[list[str], list[float]]:
     return merged_rows, merged_confs
 
 
-def call_gemini(rows: list[str]) -> list[dict]:
-    """Send reconstructed rows to local Ollama LLM (Qwen2.5-3B) for semantic
+def call_qwen(rows: list[str]) -> list[dict]:
+    """Send reconstructed rows to local Qwen2.5-3B (via Ollama) for semantic
     parsing into structured transactions. Fully offline.
 
     Args:
@@ -647,7 +647,7 @@ def call_gemini(rows: list[str]) -> list[dict]:
     chunk_size = 20
 
     # Store the raw rows being sent for debugging
-    st.session_state["gemini_input_rows"] = rows
+    st.session_state["qwen_input_rows"] = rows
 
     for chunk_start in range(0, len(rows), chunk_size):
         chunk = rows[chunk_start:chunk_start + chunk_size]
@@ -773,24 +773,24 @@ def call_gemini(rows: list[str]) -> list[dict]:
             })
 
     # Store debug log for UI display
-    st.session_state["gemini_debug"] = debug_log
-    st.session_state["gemini_raw_output"] = all_transactions
+    st.session_state["qwen_debug"] = debug_log
+    st.session_state["qwen_raw_output"] = all_transactions
 
     return all_transactions
 
 
 def validate_and_store_transactions(
-    gemini_output: list[dict], ocr_row_confidences: list[float],
+    qwen_output: list[dict], ocr_row_confidences: list[float],
     original_rows: list[str] | None = None,
 ) -> pd.DataFrame:
-    """Validate Gemini-parsed transactions and compute hybrid confidence.
+    """Validate Qwen-parsed transactions and compute hybrid confidence.
 
     Confidence = OCR confidence (50%) + LLM success (50%).
     LLM success starts at 1.0 and is penalised for invalid fields.
     Discards rows with final score < 0.2.
 
     Also detects credit transactions by checking for a '+' prefix in the
-    amount zone of the original OCR row strings (fallback when Gemini
+    amount zone of the original OCR row strings (fallback when Qwen
     doesn't set type to 'credit').
 
     Returns:
@@ -800,7 +800,7 @@ def validate_and_store_transactions(
     # Build credit row lookup from original rows.
     # The '+' prefix is added by build_rows() via geometric welding.
     # We store full row info (date fragment + amount) to match precisely
-    # against Gemini output, since index mapping is unreliable (Gemini
+    # against Qwen output, since index mapping is unreliable (Qwen
     # may skip/merge/reorder rows).
     _credit_rows: list[dict] = []
     if original_rows:
@@ -815,7 +815,7 @@ def validate_and_store_transactions(
     validated = []
     validation_debug = []
 
-    for idx, txn in enumerate(gemini_output):
+    for idx, txn in enumerate(qwen_output):
         # --- LLM success score ---
         llm_success = 1.0
         issues = []
@@ -877,7 +877,7 @@ def validate_and_store_transactions(
             except (ValueError, TypeError):
                 txn_amt_str = ""
             txn_date_str = txn.get("date", "")
-            # Extract day+month digits from Gemini date (e.g. "2026-01-27" → "0127")
+            # Extract day+month digits from Qwen date (e.g. "2026-01-27" → "0127")
             txn_date_parts = txn_date_str.replace("-", "")  # "20260127"
 
             for cr in _credit_rows:
@@ -890,7 +890,7 @@ def validate_and_store_transactions(
                 # Compare dates: original date_frag "27/01/2026" → digits "27012026"
                 cr_digits = re.sub(r"[^\d]", "", cr["date_frag"])
                 # Check overlap: day+month from original (e.g. "2701") must appear
-                # in Gemini date digits (e.g. "20260127")
+                # in Qwen date digits (e.g. "20260127")
                 if len(cr_digits) >= 4:
                     # Try DD MM from original
                     dd_mm = cr_digits[:2] + cr_digits[2:4]  # "2701"
@@ -1281,7 +1281,7 @@ if process_clicked:
     else:
         st.sidebar.warning("No receipt images found. Upload some first.")
 
-    # ── STEP 2: Process Statements (OCR → Row Reconstruction → Gemini → Validation) ──
+    # ── STEP 2: Process Statements (OCR → Row Reconstruction → Qwen → Validation) ──
     # Cache statement results — check session first, then JSON file on disk.
     _cached_stmt_name = st.session_state.get("_cached_statement_name")
     _current_stmt_name = statement_files[0].name if statement_files else None
@@ -1327,7 +1327,7 @@ if process_clicked:
         st.sidebar.info("Step 2b — Reconstructing rows…")
         # Clear debug state from previous runs
         for k in ["debug_row_layouts", "debug_row_words", "debug_credit_rows",
-                   "debug_gemini_credits"]:
+                   "debug_qwen_credits"]:
             st.session_state.pop(k, None)
 
         # Diagnostic: show page-level OCR stats
@@ -1355,21 +1355,21 @@ if process_clicked:
             st.sidebar.warning("  → 0 rows with +/CR found in OCR output")
 
         if rows:
-            # Step 2c: Send rows to Gemini for parsing
-            st.sidebar.info(f"Step 2c — Sending {len(rows)} rows to Gemini…")
-            gemini_output = call_gemini(rows)
+            # Step 2c: Send rows to Qwen for parsing
+            st.sidebar.info(f"Step 2c — Sending {len(rows)} rows to Qwen…")
+            qwen_output = call_qwen(rows)
 
-            # DEBUG: Show what types Gemini returned
-            gemini_credits = [
+            # DEBUG: Show what types Qwen returned
+            qwen_credits = [
                 (i, t.get("description", "")[:30], t.get("amount"), t.get("type"))
-                for i, t in enumerate(gemini_output) if t.get("type", "").lower() == "credit"
+                for i, t in enumerate(qwen_output) if t.get("type", "").lower() == "credit"
             ]
-            st.session_state["debug_gemini_credits"] = gemini_credits
-            st.sidebar.caption(f"  → Gemini returned {len(gemini_credits)} credit(s) out of {len(gemini_output)} txns")
+            st.session_state["debug_qwen_credits"] = qwen_credits
+            st.sidebar.caption(f"  → Qwen returned {len(qwen_credits)} credit(s) out of {len(qwen_output)} txns")
 
             # Step 2d: Validate and compute hybrid confidence scores
             st.sidebar.info("Step 2d — Validating transactions…")
-            df_statements = validate_and_store_transactions(gemini_output, ocr_confidences, rows)
+            df_statements = validate_and_store_transactions(qwen_output, ocr_confidences, rows)
 
             # DEBUG: Show final credit count in df_statements
             n_credits_final = len(df_statements[df_statements["type"] == "credit"]) if not df_statements.empty else 0
@@ -1382,7 +1382,7 @@ if process_clicked:
             st.sidebar.success(
                 f"Step 2 done — {len(df_statements)} transaction(s) validated"
             )
-            del gemini_output, rows, ocr_confidences
+            del qwen_output, rows, ocr_confidences
             gc.collect()
         else:
             st.sidebar.warning("No rows reconstructed from statements.")
@@ -1798,9 +1798,9 @@ with tab_credits:
 with tab_compare:
     st.subheader("Receipt Image vs Matched Transaction")
 
-    # ── Section A: Show all statement transactions extracted by Gemini ──
+    # ── Section A: Show all statement transactions extracted by Qwen ──
     if _df_statements is not None and not _df_statements.empty:
-        with st.expander("📄 All Statement Transactions (extracted by Gemini)", expanded=False):
+        with st.expander("📄 All Statement Transactions (extracted by Qwen)", expanded=False):
             st.dataframe(_df_statements, width="stretch", hide_index=True)
     elif _df_statements is not None:
         st.info("No transactions extracted from statement.")
@@ -2045,17 +2045,17 @@ with tab_compare:
     st.markdown("## Pipeline Debug")
 
     # Debug 1: Raw OCR rows sent to LLM
-    _gemini_rows = st.session_state.get("gemini_input_rows")
-    if _gemini_rows:
-        with st.expander(f"1. OCR Rows sent to LLM ({len(_gemini_rows)} rows)", expanded=False):
-            for i, r in enumerate(_gemini_rows):
+    _qwen_rows = st.session_state.get("qwen_input_rows")
+    if _qwen_rows:
+        with st.expander(f"1. OCR Rows sent to LLM ({len(_qwen_rows)} rows)", expanded=False):
+            for i, r in enumerate(_qwen_rows):
                 st.text(f"  [{i:2d}] {r}")
 
     # Debug 2: LLM (Ollama) response status
-    _gemini_debug = st.session_state.get("gemini_debug")
-    if _gemini_debug:
+    _qwen_debug = st.session_state.get("qwen_debug")
+    if _qwen_debug:
         with st.expander("2. LLM (Qwen2.5-3B) Response Status", expanded=True):
-            for entry in _gemini_debug:
+            for entry in _qwen_debug:
                 if entry["status"] == "OK":
                     st.success(f"**{entry['chunk']}**: Parsed {entry['parsed_count']} transactions")
                     st.caption(f"Sample: {entry.get('sample', '')}")
@@ -2066,12 +2066,12 @@ with tab_compare:
                         st.code(f"Raw response:\n{entry['raw_response']}", language=None)
 
     # Debug 3: LLM raw output (before validation)
-    _gemini_raw = st.session_state.get("gemini_raw_output")
-    if _gemini_raw:
-        with st.expander(f"3. LLM Raw Output ({len(_gemini_raw)} transactions before validation)", expanded=False):
-            df_raw = pd.DataFrame(_gemini_raw)
+    _qwen_raw = st.session_state.get("qwen_raw_output")
+    if _qwen_raw:
+        with st.expander(f"3. LLM Raw Output ({len(_qwen_raw)} transactions before validation)", expanded=False):
+            df_raw = pd.DataFrame(_qwen_raw)
             st.dataframe(df_raw, width="stretch", hide_index=True)
-    elif _gemini_rows:
+    elif _qwen_rows:
         st.error("LLM returned 0 transactions. Check that Ollama is running: ollama serve")
 
     # Debug 4: Validation results (what was kept/rejected and why)
@@ -2099,12 +2099,31 @@ with tab_compare:
 # Tab 6: OCR Debug — raw OCR text + image for every receipt
 # ---------------------------------------------------------------------------
 with tab_ocr_debug:
-    st.subheader("Receipt OCR Debug")
-    st.caption("Shows the raw OCR text extracted from each receipt image for debugging.")
+    st.subheader("Receipt Debug")
+    st.caption("Shows Qwen VLM extraction results for each receipt image.")
 
     _receipt_debug_all = st.session_state.get("debug_receipt_ocr", {})
 
     if _receipt_debug_all:
+        # ── Summary table: Qwen VLM JSON output for all receipts ──
+        st.markdown("### Qwen VLM Output (all receipts)")
+        _vlm_table_rows = []
+        for rname, rdbg in _receipt_debug_all.items():
+            llm = rdbg.get("llm_raw") or {}
+            _vlm_table_rows.append({
+                "Receipt": rname,
+                "Status": rdbg.get("status", "failed"),
+                "VLM Vendor": llm.get("vendor") or rdbg.get("vendor") or "—",
+                "VLM Amount": llm.get("amount") or rdbg.get("amount") or "—",
+                "VLM Date": llm.get("date") or rdbg.get("date") or "—",
+                "Confidence": f"{rdbg.get('confidence', 0.0):.0%}",
+                "Source": "VLM" if rdbg.get("llm_raw") else "Regex fallback",
+            })
+        st.dataframe(pd.DataFrame(_vlm_table_rows), width="stretch", hide_index=True)
+
+        st.markdown("---")
+
+        # ── Per-receipt detail ──
         for receipt_name, dbg in _receipt_debug_all.items():
             img_path = UPLOAD_DIR_RECEIPTS / receipt_name
 
@@ -2122,7 +2141,7 @@ with tab_ocr_debug:
                 f"(confidence: **{confidence:.2%}**)"
             )
 
-            col_img, col_ocr = st.columns([1, 2])
+            col_img, col_result = st.columns([1, 2])
 
             with col_img:
                 if img_path.exists():
@@ -2131,48 +2150,46 @@ with tab_ocr_debug:
                 else:
                     st.warning("Image not found on disk.")
 
+            with col_result:
                 # Show final extracted fields
-                st.markdown("**Final (used):**")
+                st.markdown("**Extracted Fields:**")
                 st.markdown(
                     f"**Vendor:** {dbg.get('vendor') or '—'}  \n"
                     f"**Amount:** {dbg.get('amount') or '—'}  \n"
                     f"**Date:** {dbg.get('date') or '—'}"
                 )
 
-                # Show LLM vs Regex comparison
+                # Show VLM JSON response
                 llm_raw = dbg.get("llm_raw")
                 st.markdown("---")
-                st.markdown("**LLM (Qwen2.5-3B) returned:**")
+                st.markdown("**Qwen VLM JSON response:**")
                 if llm_raw:
                     st.json(llm_raw)
                 else:
-                    st.caption("LLM returned nothing")
+                    st.caption("VLM returned nothing — used regex fallback")
 
-                st.markdown("**Regex returned:**")
-                st.markdown(
-                    f"Vendor: `{dbg.get('regex_vendor') or '—'}`  \n"
-                    f"Amount: `{dbg.get('regex_amount') or '—'}`  \n"
-                    f"Date: `{dbg.get('regex_date') or '—'}`"
-                )
+                # Show regex fallback if it was used
+                if not llm_raw:
+                    st.markdown("**Regex fallback:**")
+                    st.markdown(
+                        f"Vendor: `{dbg.get('regex_vendor') or '—'}`  \n"
+                        f"Amount: `{dbg.get('regex_amount') or '—'}`  \n"
+                        f"Date: `{dbg.get('regex_date') or '—'}`"
+                    )
 
-            with col_ocr:
+                # Show raw OCR text only if OCR was used (not VLM)
                 raw_text = dbg.get("raw_text", "")
                 is_vlm = raw_text.startswith("[VLM direct")
-                # Show line count
-                line_count = len(raw_text.split("\n")) if raw_text else 0
-                if is_vlm:
-                    st.caption("VLM direct extraction (no OCR used)")
-                else:
-                    st.caption(f"{line_count} OCR text lines")
-
-                st.text_area(
-                    "Raw Output",
-                    value=raw_text,
-                    height=400,
-                    key=f"ocr_debug_{receipt_name}",
-                    disabled=True,
-                )
+                if not is_vlm and raw_text:
+                    with st.expander("Raw OCR Text (fallback)", expanded=False):
+                        st.text_area(
+                            "OCR Output",
+                            value=raw_text,
+                            height=300,
+                            key=f"ocr_debug_{receipt_name}",
+                            disabled=True,
+                        )
 
             st.divider()
     else:
-        st.info("Run processing to see OCR debug output for each receipt.")
+        st.info("Run processing to see receipt debug output.")
