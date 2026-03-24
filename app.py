@@ -692,21 +692,17 @@ def call_qwen(rows: list[str]) -> list[dict]:
             "Convert each row into JSON with fields:\n"
             "- date (YYYY-MM-DD)\n"
             "- description\n"
-            "- amount (float)\n"
-            "- type (debit/credit/unknown)\n\n"
+            "- amount (float, always positive)\n\n"
             "Rules:\n"
             "- Dates must be normalized to YYYY-MM-DD (input is DD/MM/YYYY Indian format)\n"
-            "- Remove currency symbols\n"
-            "- Use DR → debit, CR → credit\n"
-            "- Amounts with '+' prefix are credits; others are debits\n"
-            "- If type is unclear, use 'unknown'\n"
+            "- Remove currency symbols and +/- signs from amounts\n"
             "- Ignore invalid/header rows\n"
             "- Each row has token hints after // showing which zone each part belongs to\n\n"
             "Examples:\n"
             'Input: "12/02/2026 | Amazon Pay | 1,200.00  // hints: [DATE_ZONE: 12/02/2026] [DESC_ZONE: Amazon Pay] [AMOUNT_ZONE: 1,200.00]"\n'
-            'Output: {"date":"2026-02-12","description":"Amazon Pay","amount":1200.00,"type":"debit"}\n\n'
+            'Output: {"date":"2026-02-12","description":"Amazon Pay","amount":1200.00}\n\n'
             'Input: "13/02/2026 | Swiggy | +450.00  // hints: [DATE_ZONE: 13/02/2026] [DESC_ZONE: Swiggy] [AMOUNT_ZONE: +450.00]"\n'
-            'Output: {"date":"2026-02-13","description":"Swiggy","amount":450.00,"type":"credit"}\n\n'
+            'Output: {"date":"2026-02-13","description":"Swiggy","amount":450.00}\n\n'
             "Return ONLY a valid JSON array. No explanation.\n\n"
             f"Now process these rows:\n{rows_text}"
         )
@@ -886,9 +882,10 @@ def validate_and_store_transactions(
         if final_score < 0.2:
             continue
 
-        # Determine type: if the original row had '+' (from geometric welding),
-        # mark as credit. Match by amount + date digits to avoid index misalignment.
-        txn_type = txn.get("type", "debit").lower()
+        # Determine type: ONLY trust '+' prefix from geometric welding (OCR pixel
+        # probing). Ignore Qwen's credit/debit classification — it guesses wrong.
+        # Default everything to debit, override to credit only if '+' was found.
+        txn_type = "debit"
         credit_flag = False
 
         if _credit_rows:
@@ -897,34 +894,27 @@ def validate_and_store_transactions(
             except (ValueError, TypeError):
                 txn_amt_str = ""
             txn_date_str = txn.get("date", "")
-            # Extract day+month digits from Qwen date (e.g. "2026-01-27" → "0127")
             txn_date_parts = txn_date_str.replace("-", "")  # "20260127"
 
             for cr in _credit_rows:
-                # Compare amounts (handle float precision: "3598.26" vs "3598.26")
                 try:
                     if abs(float(cr["amount"]) - float(txn_amt_str)) > 0.01:
                         continue
                 except (ValueError, TypeError):
                     continue
-                # Compare dates: original date_frag "27/01/2026" → digits "27012026"
                 cr_digits = re.sub(r"[^\d]", "", cr["date_frag"])
-                # Check overlap: day+month from original (e.g. "2701") must appear
-                # in Qwen date digits (e.g. "20260127")
                 if len(cr_digits) >= 4:
-                    # Try DD MM from original
-                    dd_mm = cr_digits[:2] + cr_digits[2:4]  # "2701"
-                    mm_dd = cr_digits[2:4] + cr_digits[:2]  # "0127"
+                    dd_mm = cr_digits[:2] + cr_digits[2:4]
+                    mm_dd = cr_digits[2:4] + cr_digits[:2]
                     if dd_mm in txn_date_parts or mm_dd in txn_date_parts:
                         credit_flag = True
                         break
                 else:
-                    # Can't verify date — amount alone matched, trust it
                     credit_flag = True
                     break
 
         overridden = False
-        if txn_type != "credit" and credit_flag:
+        if credit_flag:
             txn_type = "credit"
             overridden = True
 
