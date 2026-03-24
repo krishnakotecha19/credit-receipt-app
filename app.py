@@ -547,19 +547,14 @@ def build_rows(ocr_pages: list[dict]) -> tuple[list[str], list[float]]:
 
             # Step 1: identify the rightmost amount-like token in the row
             _amount_idx = -1   # index in row_words of the chosen amount token
-            _sign_idx = -1     # index of a standalone '+'/'-' just before it
             for wi in range(len(row_words) - 1, -1, -1):
                 w = row_words[wi]
                 text = w["text"]
-                # Fix OCR noise before checking
                 cleaned = text.replace("O", "0").replace("o", "0").replace("l", "1")
                 if cleaned.startswith("R") and len(cleaned) > 1 and cleaned[1:2].isdigit():
                     cleaned = cleaned[1:]
                 if _AMOUNT_TOKEN_RE.match(cleaned) and ("," in cleaned or "." in cleaned):
                     _amount_idx = wi
-                    # Check if the word just before is a standalone sign
-                    if wi > 0 and row_words[wi - 1]["text"].strip() in ("+", "-"):
-                        _sign_idx = wi - 1
                     break
 
             # If no amount with decimal/comma found, try any numeric token from right
@@ -569,15 +564,51 @@ def build_rows(ocr_pages: list[dict]) -> tuple[list[str], list[float]]:
                     cleaned = w["text"].replace("O", "0").replace("o", "0").replace("l", "1")
                     if _AMOUNT_TOKEN_RE.match(cleaned):
                         _amount_idx = wi
-                        if wi > 0 and row_words[wi - 1]["text"].strip() in ("+", "-"):
-                            _sign_idx = wi - 1
                         break
 
-            # Step 2: build date, description, amount from the split
+            # Step 2: detect credit — look for '+' ANYWHERE near the right
+            # side of the row (within 3 words of the amount, or any word
+            # to the right of the description zone).
+            row_is_credit = False
+            if _amount_idx >= 0:
+                # Check geometric welding first (pixel-level '+' detection)
+                if row_words[_amount_idx].get("has_plus_prefix"):
+                    row_is_credit = True
+
+                # Check nearby words (up to 3 positions before the amount)
+                # for a standalone '+' sign
+                if not row_is_credit:
+                    search_start = max(0, _amount_idx - 3)
+                    for si in range(search_start, _amount_idx):
+                        if row_words[si]["text"].strip() == "+":
+                            row_is_credit = True
+                            break
+
+                # Check if any word AFTER the amount is '+'
+                if not row_is_credit:
+                    for si in range(_amount_idx + 1, len(row_words)):
+                        if row_words[si]["text"].strip() == "+":
+                            row_is_credit = True
+                            break
+
+                # Check if the amount token itself starts with '+'
+                amt_text = row_words[_amount_idx]["text"]
+                if amt_text.strip().startswith("+"):
+                    row_is_credit = True
+
+            # Step 3: build date, description, amount from the split
+            # Words that are standalone '+'/'-' near the amount are consumed
+            # (not added to description)
+            _plus_minus_indices = set()
+            if _amount_idx >= 0:
+                search_start = max(0, _amount_idx - 3)
+                for si in range(search_start, min(len(row_words), _amount_idx + 3)):
+                    if si != _amount_idx and row_words[si]["text"].strip() in ("+", "-"):
+                        _plus_minus_indices.add(si)
+
             date_parts = []
             desc_parts = []
             amount_str = ""
-            row_is_credit = False
 
             for wi, w in enumerate(row_words):
                 cx = w["center_x"]
@@ -587,26 +618,17 @@ def build_rows(ocr_pages: list[dict]) -> tuple[list[str], list[float]]:
                     cleaned = text.replace("O", "0").replace("o", "0").replace("l", "1")
                     if cleaned.startswith("R") and len(cleaned) > 1 and cleaned[1:2].isdigit():
                         cleaned = cleaned[1:]
-                    amount_str = cleaned
-                elif wi == _sign_idx:
-                    # standalone sign for the amount
-                    if text.strip() == "+":
-                        row_is_credit = True
+                    # Strip leading '+' from the amount value itself
+                    amount_str = cleaned.lstrip("+")
+                elif wi in _plus_minus_indices:
+                    # consumed by credit detection — don't add to description
+                    pass
                 elif cx < date_cutoff:
                     date_parts.append(text)
                 else:
                     desc_parts.append(text)
 
-            # Credit detection via Geometric Welding (pixel probe for '+' sign)
-            if not row_is_credit and _amount_idx >= 0:
-                w = row_words[_amount_idx]
-                if w.get("has_plus_prefix"):
-                    row_is_credit = True
-            # Also check if amount_str itself starts with '+'
-            if amount_str.startswith("+"):
-                row_is_credit = True
-                amount_str = amount_str[1:]
-
+            # Prepend '+' to amount string if credit
             if row_is_credit and amount_str and not amount_str.startswith("+"):
                 amount_str = "+" + amount_str
 
