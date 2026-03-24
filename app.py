@@ -1500,6 +1500,28 @@ with st.sidebar:
             f.unlink(missing_ok=True)
         st.rerun()
 
+# ---- Auto-invalidate stale results when uploaded files change ----
+# Track what was uploaded so we don't show stale results from a previous run.
+_current_receipt_names = sorted(uf.name for uf in uploaded_receipts) if uploaded_receipts else []
+_current_stmt_name = uploaded_statement.name if uploaded_statement else None
+_prev_receipt_names = st.session_state.get("_prev_receipt_names", [])
+_prev_stmt_name = st.session_state.get("_prev_stmt_name")
+
+if _current_receipt_names != _prev_receipt_names:
+    # Receipts changed — clear receipt + match results (statement can stay)
+    for k in ["df_receipts", "df_matches", "debug_receipt_ocr"]:
+        st.session_state.pop(k, None)
+    st.session_state["_prev_receipt_names"] = _current_receipt_names
+
+if _current_stmt_name and _current_stmt_name != _prev_stmt_name:
+    # Statement changed — clear statement + match results (receipts can stay)
+    for k in ["df_statements", "df_matches", "_cached_statement_name",
+              "statement_pages", "debug_row_layouts", "debug_row_words",
+              "debug_credit_rows", "qwen_input_rows", "qwen_debug",
+              "qwen_raw_output", "debug_qwen_credits", "validation_debug"]:
+        st.session_state.pop(k, None)
+    st.session_state["_prev_stmt_name"] = _current_stmt_name
+
 # ---- Save uploaded files to disk & process ONLY when Process is clicked ----
 receipt_files = []
 statement_files = []
