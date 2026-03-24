@@ -222,7 +222,7 @@ def process_statement_pdf(pdf_path: str) -> list[dict]:
     try:
         proc = subprocess.run(
             [sys.executable, _STATEMENT_WORKER, str(pdf_path)] + ([POPPLER_PATH] if POPPLER_PATH else []),
-            capture_output=True, text=True, timeout=300,
+            capture_output=True, text=True, timeout=600,
             cwd=str(_SCRIPT_DIR),
         )
         if proc.returncode != 0:

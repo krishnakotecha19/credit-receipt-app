@@ -32,8 +32,10 @@ _doctr_engine = None
 def _get_doctr():
     global _doctr_engine
     if _doctr_engine is None:
+        print("Loading DocTR model (first run may download weights)...", file=sys.stderr, flush=True)
         from doctr.models import ocr_predictor
         _doctr_engine = ocr_predictor(pretrained=True)
+        print("DocTR model loaded.", file=sys.stderr, flush=True)
     return _doctr_engine
 
 
@@ -86,7 +88,7 @@ def process_statement_pdf(pdf_path: str, poppler_path: str = None) -> list[dict]
 
     pages_out = []
     try:
-        kwargs = {"dpi": 300}
+        kwargs = {"dpi": 200}
         if poppler_path:
             kwargs["poppler_path"] = poppler_path
         pil_images = convert_from_path(pdf_path, **kwargs)
