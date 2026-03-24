@@ -382,9 +382,12 @@ def build_rows(ocr_pages: list[dict]) -> tuple[list[str], list[float]]:
                        "description", "offers", "explore", "credit card",
                        "gstin", "hsn"}
     # Words that are header-like ONLY when the row has NO date pattern
-    # (e.g. "International Transactions" header vs "AMAZON INTERNATIONAL 5432.00")
-    _HEADER_IF_NO_DATE = {"total", "balance", "transaction", "amount",
-                           "domestic", "international"}
+    _HEADER_IF_NO_DATE = {"total", "balance", "amount"}
+    # Section dividers — skip only when the ENTIRE row is just these words
+    # (e.g. "International Transactions", "Domestic Transactions")
+    _SECTION_DIVIDER_RE = re.compile(
+        r"^(?:international|domestic)\s+transactions?$", re.IGNORECASE
+    )
     # Date patterns: DD/MM/YYYY, DD-MM-YYYY, YYYY-MM-DD, DD MMM YYYY, DD/MM/YY
     _DATE_RE = re.compile(
         r"\d{2}[/\-]\d{2}[/\-]\d{2,4}"       # DD/MM/YYYY or DD-MM-YY
@@ -415,8 +418,27 @@ def build_rows(ocr_pages: list[dict]) -> tuple[list[str], list[float]]:
         # Sort by vertical position
         words.sort(key=lambda w: w["center_y"])
 
-        # Cluster words into rows by Y proximity
-        row_threshold = 0.015  # relative to page height (normalized 0-1)
+        # Cluster words into rows by Y proximity — adaptive threshold
+        # Compute from actual inter-word Y gaps on this page so tightly
+        # spaced statements (e.g. international sections) don't get merged.
+        y_centers = sorted(set(round(w["center_y"], 4) for w in words))
+        if len(y_centers) > 3:
+            gaps = sorted(
+                y_centers[i + 1] - y_centers[i]
+                for i in range(len(y_centers) - 1)
+                if y_centers[i + 1] - y_centers[i] > 0.002  # ignore noise
+            )
+            if gaps:
+                # Use 40th-percentile of real gaps — tight enough to split
+                # rows that are close together but still groups words on the
+                # same line.
+                p40 = gaps[int(len(gaps) * 0.4)]
+                row_threshold = max(0.005, min(p40 * 0.7, 0.015))
+            else:
+                row_threshold = 0.008
+        else:
+            row_threshold = 0.008
+
         rows_clustered = []
         current_row = [words[0]]
 
@@ -441,6 +463,8 @@ def build_rows(ocr_pages: list[dict]) -> tuple[list[str], list[float]]:
             _row_layout_debug = st.session_state.setdefault("debug_row_layouts", [])
             _row_layout_debug.append({
                 "page": page_data.get("page_number", 1),
+                "row_threshold": round(row_threshold, 5),
+                "rows_clustered": len(rows_clustered),
                 "date_cutoff": round(date_cutoff, 4),
                 "amount_cutoff": round(amount_cutoff, 4),
                 "p15": round(page_p15, 4),
@@ -472,7 +496,8 @@ def build_rows(ocr_pages: list[dict]) -> tuple[list[str], list[float]]:
             is_always_header = any(hw in row_text_lower for hw in _HEADER_ALWAYS)
             is_conditional_header = (not row_has_date and
                                      any(hw in row_text_lower for hw in _HEADER_IF_NO_DATE))
-            if is_always_header or is_conditional_header:
+            is_section_divider = bool(_SECTION_DIVIDER_RE.match(row_text_lower.strip()))
+            if is_always_header or is_conditional_header or is_section_divider:
                 # Look for "cr" / "credit" column header to learn the credit X zone
                 for w in row_words:
                     wt = w["text"].lower().strip()
@@ -941,6 +966,248 @@ def validate_and_store_transactions(
     return df
 
 
+# ---------------------------------------------------------------------------
+# Online Pipeline helpers — HuggingFace Inference API
+#   - Receipts:   HF Qwen2.5-VL (vision) reads receipt images directly
+#   - Statements: DocTR (local) → build_rows → HF Qwen2.5 (text) parses rows
+#   No financial document images leave the machine — only receipt images
+#   and extracted row-text strings are sent to HF.
+# ---------------------------------------------------------------------------
+
+def _hf_chat(messages: list[dict], max_tokens: int = 2048,
+             model: str | None = None) -> str | None:
+    """Generic HF Inference API chat-completions call. Returns response text."""
+    hf_key = os.environ.get("HF_API_KEY", "")
+    if not hf_key:
+        return None
+    if model is None:
+        model = os.environ.get("HF_VLM_MODEL", "Qwen/Qwen2.5-VL-7B-Instruct")
+    try:
+        resp = requests.post(
+            "https://router.huggingface.co/v1/chat/completions",
+            headers={
+                "Authorization": f"Bearer {hf_key}",
+                "Content-Type": "application/json",
+            },
+            json={
+                "model": model,
+                "messages": messages,
+                "max_tokens": max_tokens,
+                "temperature": 0.1,
+            },
+            timeout=180,
+        )
+        if resp.status_code != 200:
+            print(f"HF API error {resp.status_code}: {resp.text[:300]}", file=sys.stderr)
+            return None
+        return resp.json()["choices"][0]["message"]["content"]
+    except Exception as e:
+        print(f"HF API error: {e}", file=sys.stderr)
+        return None
+
+
+def _hf_parse_json(raw_text: str | None) -> list | dict | None:
+    """Extract JSON array or object from HF response (handles markdown fences)."""
+    if not raw_text:
+        return None
+    cleaned = raw_text.strip()
+    if cleaned.startswith("```"):
+        cleaned = re.sub(r"^```(?:json)?\s*", "", cleaned)
+        cleaned = re.sub(r"\s*```$", "", cleaned)
+    arr_match = re.search(r'\[.*\]', cleaned, re.DOTALL)
+    if arr_match:
+        cleaned = arr_match.group(0)
+    else:
+        obj_match = re.search(r'\{[^{}]*\}', cleaned)
+        if obj_match:
+            cleaned = obj_match.group(0)
+    try:
+        return json.loads(cleaned)
+    except json.JSONDecodeError:
+        return None
+
+
+# ── HF Receipt extraction (VLM — sends the receipt IMAGE) ────────────────
+
+def _hf_extract_receipt(image_path: str) -> dict:
+    """Extract vendor/amount/date from a receipt image via HF Qwen2.5-VL."""
+    import base64
+    fallback = {
+        "receipt_file": os.path.basename(image_path),
+        "vendor": None, "amount": None, "date": None,
+        "raw_text": "", "confidence": 0.0, "status": "failed",
+    }
+
+    # Encode image as base64 JPEG (resize to max 1024px)
+    try:
+        img = _load_image_fixed(Path(image_path))
+        w, h = img.size
+        max_side = 1024
+        if max(w, h) > max_side:
+            scale = max_side / max(w, h)
+            img = img.resize((int(w * scale), int(h * scale)), Image.LANCZOS)
+        buf = BytesIO()
+        img.save(buf, format="JPEG", quality=85)
+        img_b64 = base64.b64encode(buf.getvalue()).decode("utf-8")
+    except Exception as e:
+        fallback["raw_text"] = f"Image encode error: {e}"
+        return fallback
+
+    prompt = (
+        "Look at this receipt image carefully. Extract these 3 fields.\n"
+        'Return ONLY valid JSON: {"vendor": "...", "amount": number, "date": "YYYY-MM-DD"}\n\n'
+        "1. vendor: The store/restaurant/company name printed at the top.\n"
+        "2. amount: The FINAL TOTAL amount paid (after discounts/taxes). "
+        "Look for 'Grand Total', 'Net Amount', 'Total', 'Amount Paid', 'You Pay'. "
+        "Do NOT pick subtotal, tax, CGST, SGST, discount, or MRP.\n"
+        "3. date: The billing/transaction date. Indian format DD/MM/YYYY → convert to YYYY-MM-DD.\n\n"
+        "Use null for any field you cannot read. No explanation, JSON only."
+    )
+
+    raw = _hf_chat([{
+        "role": "user",
+        "content": [
+            {"type": "image_url",
+             "image_url": {"url": f"data:image/jpeg;base64,{img_b64}"}},
+            {"type": "text", "text": prompt},
+        ],
+    }], max_tokens=200)
+
+    parsed = _hf_parse_json(raw)
+    if not parsed or not isinstance(parsed, dict):
+        fallback["raw_text"] = f"HF VLM returned unparseable response: {(raw or '')[:200]}"
+        return fallback
+
+    result = {
+        "receipt_file": os.path.basename(image_path),
+        "vendor": parsed.get("vendor"),
+        "amount": None,
+        "date": parsed.get("date"),
+        "raw_text": f"[HF VLM extraction]\n{raw}",
+        "confidence": 0.90,
+        "status": "success",
+    }
+    try:
+        result["amount"] = float(parsed["amount"])
+    except (TypeError, ValueError, KeyError):
+        pass
+
+    if not result["vendor"] and not result["amount"]:
+        result["status"] = "failed"
+        result["confidence"] = 0.0
+
+    return result
+
+
+def hf_extract_receipts_batch(image_paths: list[str],
+                              progress_callback=None) -> list[dict]:
+    """Process multiple receipts via HF Qwen2.5-VL (sequential)."""
+    results = []
+    for i, path in enumerate(image_paths):
+        data = _hf_extract_receipt(path)
+        results.append(data)
+        if progress_callback:
+            progress_callback(i + 1, len(image_paths))
+    return results
+
+
+# ── HF Statement row parsing (TEXT only — no images sent) ─────────────────
+
+def hf_call_qwen_text(rows: list[str]) -> list[dict]:
+    """Send OCR row strings to HF Qwen2.5 text model for structured parsing.
+
+    Same logic as call_qwen() but uses HF Inference API instead of local Ollama.
+    Only row TEXT is sent — no images, no financial documents.
+    """
+    hf_text_model = os.environ.get("HF_TEXT_MODEL",
+                                   os.environ.get("HF_VLM_MODEL",
+                                                  "Qwen/Qwen2.5-VL-7B-Instruct"))
+
+    all_transactions = []
+    debug_log = []
+    chunk_size = 20
+
+    st.session_state["qwen_input_rows"] = rows
+
+    for chunk_start in range(0, len(rows), chunk_size):
+        chunk = rows[chunk_start:chunk_start + chunk_size]
+
+        annotated_rows = []
+        for row_str in chunk:
+            segments = row_str.split(" | ")
+            hints = []
+            if len(segments) >= 1:
+                hints.append(f"[DATE_ZONE: {segments[0]}]")
+            if len(segments) >= 2:
+                hints.append(f"[DESC_ZONE: {segments[1]}]")
+            if len(segments) >= 3:
+                hints.append(f"[AMOUNT_ZONE: {segments[2]}]")
+            annotated_rows.append(f"{row_str}  // hints: {' '.join(hints)}")
+
+        rows_text = "\n".join(annotated_rows)
+
+        prompt = (
+            "You are an expert financial document parser.\n\n"
+            "Convert each row into JSON with fields:\n"
+            "- date (YYYY-MM-DD)\n"
+            "- description\n"
+            "- amount (float, always positive)\n\n"
+            "Rules:\n"
+            "- Dates must be normalized to YYYY-MM-DD (input is DD/MM/YYYY Indian format)\n"
+            "- Remove currency symbols and +/- signs from amounts\n"
+            "- Ignore invalid/header rows\n"
+            "- Each row has token hints after // showing which zone each part belongs to\n\n"
+            "Examples:\n"
+            'Input: "12/02/2026 | Amazon Pay | 1,200.00  // hints: [DATE_ZONE: 12/02/2026] '
+            '[DESC_ZONE: Amazon Pay] [AMOUNT_ZONE: 1,200.00]"\n'
+            'Output: {"date":"2026-02-12","description":"Amazon Pay","amount":1200.00}\n\n'
+            'Input: "13/02/2026 | Swiggy | +450.00  // hints: [DATE_ZONE: 13/02/2026] '
+            '[DESC_ZONE: Swiggy] [AMOUNT_ZONE: +450.00]"\n'
+            'Output: {"date":"2026-02-13","description":"Swiggy","amount":450.00}\n\n'
+            "Return ONLY a valid JSON array. No explanation.\n\n"
+            f"Now process these rows:\n{rows_text}"
+        )
+
+        raw = _hf_chat(
+            [{"role": "user", "content": prompt}],
+            max_tokens=2000,
+            model=hf_text_model,
+        )
+
+        parsed = _hf_parse_json(raw)
+
+        if parsed and isinstance(parsed, list):
+            for txn in parsed:
+                if isinstance(txn, dict) and "description" in txn:
+                    try:
+                        amt = float(txn.get("amount", 0))
+                    except (ValueError, TypeError):
+                        amt = 0.0
+                    all_transactions.append({
+                        "date": txn.get("date", ""),
+                        "description": txn.get("description", ""),
+                        "amount": amt,
+                        "type": txn.get("type", "debit"),
+                    })
+            debug_log.append({
+                "chunk": f"rows {chunk_start+1}-{chunk_start+len(chunk)}",
+                "status": "OK",
+                "parsed_count": len(parsed),
+                "sample": str(parsed[:2])[:200] if parsed else "",
+            })
+        else:
+            debug_log.append({
+                "chunk": f"rows {chunk_start+1}-{chunk_start+len(chunk)}",
+                "status": "FAILED",
+                "error": f"Unparseable: {(raw or '')[:300]}",
+                "raw_response": (raw or "")[:300],
+            })
+
+    st.session_state["qwen_debug"] = debug_log
+    st.session_state["qwen_raw_output"] = all_transactions
+    return all_transactions
+
+
 _VENDOR_ALIASES = {
     "amazon": ["amzn", "amzn mktp", "amazon.in", "amazon pay"],
     "swiggy": ["swiggy", "bundl technologies"],
@@ -1215,10 +1482,12 @@ with st.sidebar:
 
     st.divider()
 
-    # Process button
-    col_proc, col_clear = st.columns([2, 1])
+    # Process buttons
+    col_proc, col_online, col_clear = st.columns([2, 2, 1])
     with col_proc:
         process_clicked = st.button("Process", type="primary", use_container_width=True)
+    with col_online:
+        process_online_clicked = st.button("Process Online", type="secondary", use_container_width=True)
     with col_clear:
         if st.button("Clear Cache", use_container_width=True):
             # Wipe all cached state so next Process runs fresh
@@ -1239,7 +1508,7 @@ with st.sidebar:
 receipt_files = []
 statement_files = []
 
-if process_clicked:
+if process_clicked or process_online_clicked:
     # Save files to disk only when processing
     if uploaded_receipts:
         for uf in uploaded_receipts:
@@ -1450,6 +1719,160 @@ if process_clicked:
 
     # Persist session state to disk after all processing steps
     _save_session_state()
+
+# ---------------------------------------------------------------------------
+# ONLINE PIPELINE — HF Qwen2.5-VL for receipts, local DocTR + HF text for
+# statements.  No financial document images leave the machine.
+# ---------------------------------------------------------------------------
+if process_online_clicked:
+    hf_key_check = os.environ.get("HF_API_KEY", "")
+    if not hf_key_check:
+        st.sidebar.error("HF_API_KEY not set in .env — cannot run online pipeline.")
+    else:
+        # ── STEP 1: Process Receipts via HF Qwen2.5-VL ──
+        if receipt_files:
+            progress = st.sidebar.progress(0, text="[Online] Step 1/2 — Receipts via HF VLM…")
+
+            def _hf_receipt_progress(done, total):
+                progress.progress(done / total, text=f"[Online] Receipt {done}/{total} (HF VLM)")
+
+            receipt_records = hf_extract_receipts_batch(
+                [str(f) for f in receipt_files],
+                progress_callback=_hf_receipt_progress,
+            )
+
+            n_ok = sum(1 for r in receipt_records if r.get("status") == "success")
+            n_fail = len(receipt_records) - n_ok
+            if n_fail:
+                st.sidebar.warning(f"[Online] Receipts: {n_ok} success, {n_fail} failed")
+
+            receipt_debug = st.session_state.setdefault("debug_receipt_ocr", {})
+            for data in receipt_records:
+                receipt_debug[data.get("receipt_file", "")] = {
+                    "raw_text": data.get("raw_text", ""),
+                    "vendor": data.get("vendor"),
+                    "amount": data.get("amount"),
+                    "date": data.get("date"),
+                    "confidence": data.get("confidence", 0.0),
+                    "status": data.get("status", "failed"),
+                }
+            gc.collect()
+            progress.empty()
+
+            df_new = pd.DataFrame(receipt_records)
+            if "df_receipts" in st.session_state:
+                existing = st.session_state["df_receipts"]
+                df_new = pd.concat([existing, df_new]).drop_duplicates(
+                    subset="receipt_file", keep="last"
+                ).reset_index(drop=True)
+            st.session_state["df_receipts"] = df_new
+            st.sidebar.success(f"[Online] Step 1 done — {len(receipt_records)} receipt(s) via HF VLM")
+            del receipt_records
+            gc.collect()
+        elif st.session_state.get("df_receipts") is not None:
+            st.sidebar.info("[Online] No new receipts. Using previously processed data.")
+        else:
+            st.sidebar.warning("[Online] No receipt images found.")
+
+        # ── STEP 2: Statements — local DocTR OCR → build_rows → HF text model ──
+        _cached_stmt_name_ol = st.session_state.get("_cached_statement_name")
+        _current_stmt_name_ol = statement_files[0].name if statement_files else None
+        _stmt_cached_ol = (
+            _current_stmt_name_ol
+            and _current_stmt_name_ol == _cached_stmt_name_ol
+            and st.session_state.get("df_statements") is not None
+        )
+
+        if not _stmt_cached_ol and _current_stmt_name_ol:
+            _cached_df_ol = _load_stmt_cache(_current_stmt_name_ol)
+            if _cached_df_ol is not None:
+                st.session_state["df_statements"] = _cached_df_ol
+                st.session_state["_cached_statement_name"] = _current_stmt_name_ol
+                _stmt_cached_ol = True
+                st.sidebar.success(f"[Online] Loaded '{_current_stmt_name_ol}' from cache")
+
+        if statement_files and not _stmt_cached_ol:
+            # Step 2a: Local DocTR OCR (same subprocess as offline — no data leaves machine)
+            progress = st.sidebar.progress(0, text="[Online] Step 2a — Local OCR (DocTR)…")
+            all_statement_pages = []
+            for idx, sfile in enumerate(statement_files):
+                try:
+                    pages = process_statement_pdf(str(sfile))
+                    all_statement_pages.extend(pages)
+                except Exception as e:
+                    all_statement_pages.append({
+                        "page_number": -1, "raw_ocr_words": [],
+                        "status": f"failed: {e}",
+                    })
+                gc.collect()
+                progress.progress((idx + 1) / len(statement_files),
+                                  text=f"[Online] OCR page {idx + 1}/{len(statement_files)}")
+            progress.empty()
+            st.session_state["statement_pages"] = all_statement_pages
+
+            for pg in all_statement_pages:
+                pg_num = pg.get("page_number", "?")
+                n_words = len(pg.get("raw_ocr_words", []))
+                st.sidebar.caption(f"  Page {pg_num}: {pg.get('status', '?')} — {n_words} words")
+
+            # Step 2b: Build rows locally
+            st.sidebar.info("[Online] Step 2b — Reconstructing rows…")
+            rows, ocr_confidences = build_rows(all_statement_pages)
+            del all_statement_pages
+            gc.collect()
+            st.sidebar.caption(f"  → {len(rows)} row(s) reconstructed")
+
+            if rows:
+                # Step 2c: Send row TEXT to HF Qwen2.5 text model (no images)
+                st.sidebar.info(f"[Online] Step 2c — Sending {len(rows)} rows to HF Qwen2.5…")
+                qwen_output = hf_call_qwen_text(rows)
+                st.sidebar.caption(
+                    f"  → HF returned {len(qwen_output)} transaction(s)"
+                )
+
+                # Step 2d: Validate
+                st.sidebar.info("[Online] Step 2d — Validating transactions…")
+                df_statements = validate_and_store_transactions(
+                    qwen_output, ocr_confidences, rows
+                )
+
+                st.session_state["_cached_statement_name"] = _current_stmt_name_ol
+                _save_stmt_cache(_current_stmt_name_ol, df_statements)
+
+                st.sidebar.success(
+                    f"[Online] Step 2 done — {len(df_statements)} transaction(s) via HF text model"
+                )
+                del qwen_output, rows, ocr_confidences
+                gc.collect()
+            else:
+                st.sidebar.warning("[Online] No rows reconstructed from statements.")
+        elif _stmt_cached_ol:
+            st.sidebar.success(
+                f"[Online] Statement '{_current_stmt_name_ol}' already cached — "
+                f"{len(st.session_state['df_statements'])} txn(s)"
+            )
+        elif st.session_state.get("df_statements") is not None:
+            st.sidebar.info("[Online] No new statements. Using previously processed data.")
+        else:
+            st.sidebar.info("[Online] No statements uploaded.")
+
+        # ── STEP 3: Match (same as offline) ──
+        if "df_receipts" in st.session_state and "df_statements" in st.session_state:
+            st.sidebar.info("[Online] Step 3 — Matching receipts to transactions…")
+            df_matches = match_transactions(
+                st.session_state["df_receipts"],
+                st.session_state["df_statements"],
+            )
+            st.session_state["df_matches"] = df_matches
+            n_auto = len(df_matches[df_matches["status"] == "auto_approved"])
+            n_review = len(df_matches[df_matches["status"] == "review"])
+            n_unmatched = len(df_matches[df_matches["match_score"] == 0])
+
+            st.sidebar.success(
+                f"[Online] Step 3 done — {n_auto} auto, {n_review} review, {n_unmatched} unmatched"
+            )
+
+        _save_session_state()
 
 # ---------------------------------------------------------------------------
 # Helper: generate export bytes
