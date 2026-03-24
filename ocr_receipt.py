@@ -710,10 +710,20 @@ def _extract_via_llm(image_path: str, raw_text: str) -> dict | None:
     ollama_model = os.environ.get("OLLAMA_MODEL", "qwen2.5vl:3b")
 
     # ── Try VLM (vision) first — send actual image ──
+    # Resize to max 1024px on longest side before sending — phone photos
+    # can be 3000x4000+ which makes VLM inference extremely slow.
     img_b64 = None
     try:
-        with open(image_path, "rb") as f:
-            img_b64 = base64.b64encode(f.read()).decode("utf-8")
+        img = cv2.imread(image_path)
+        if img is not None:
+            h, w = img.shape[:2]
+            max_side = 1024
+            if max(h, w) > max_side:
+                scale = max_side / max(h, w)
+                img = cv2.resize(img, None, fx=scale, fy=scale, interpolation=cv2.INTER_AREA)
+            _, buf = cv2.imencode(".jpg", img, [cv2.IMWRITE_JPEG_QUALITY, 85])
+            img_b64 = base64.b64encode(buf.tobytes()).decode("utf-8")
+            del img, buf
     except Exception:
         pass
 
