@@ -896,9 +896,9 @@ if __name__ == "__main__":
     image_paths = sys.argv[1:]
 
     if len(image_paths) == 1:
-        # Single-receipt mode (backward compatible)
+        # Single-receipt mode — wrap in list for batch compatibility
         data = extract_receipt_data(image_paths[0])
-        print(json.dumps(data, ensure_ascii=False))
+        print(json.dumps([data], ensure_ascii=False))
     else:
         # ── Batch mode: process ALL receipts ──
         # VLM is primary — no need to pre-warm PaddleOCR.
