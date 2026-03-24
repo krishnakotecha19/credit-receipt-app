@@ -471,8 +471,59 @@ def build_rows(ocr_pages: list[dict]) -> tuple[list[str], list[float]]:
                     current_col_words.append(row_words[j])
             columns.append(current_col_words)
 
-            # Join words within each column, then join columns with |
-            col_texts = [" ".join(w["text"] for w in col) for col in columns]
+            # --- Identify the rightmost amount column ---
+            # The amount is always the rightmost column that contains a
+            # number with a decimal point.  Check that column's words for
+            # '+' (geometric welding or standalone token) to detect credit.
+            _AMT_COL_RE = re.compile(r"\d[\d,]*\.\d")
+
+            amount_col_idx = -1
+            for ci in range(len(columns) - 1, -1, -1):
+                col_text = " ".join(w["text"] for w in columns[ci])
+                if _AMT_COL_RE.search(col_text):
+                    amount_col_idx = ci
+                    break
+
+            # Build column texts
+            col_texts = []
+            is_credit = False
+
+            for ci, col_words in enumerate(columns):
+                if ci == amount_col_idx:
+                    # This is the amount column — check for credit
+                    # 1) geometric welding on any word in this column
+                    if any(w.get("has_plus_prefix") for w in col_words):
+                        is_credit = True
+                    # 2) standalone '+' token in this column
+                    if any(w["text"].strip() == "+" for w in col_words):
+                        is_credit = True
+                    # 3) '+' token in the column just before amount
+                    if ci > 0:
+                        prev_col_text = " ".join(w["text"] for w in columns[ci - 1]).strip()
+                        if prev_col_text == "+":
+                            is_credit = True
+                            # Don't include the standalone '+' column in output
+                            if col_texts and col_texts[-1].strip() == "+":
+                                col_texts.pop()
+
+                    # Build amount text: strip standalone +/- from words,
+                    # keep only the numeric part
+                    amt_parts = []
+                    for w in col_words:
+                        t = w["text"].strip()
+                        if t in ("+", "-"):
+                            continue  # consumed for credit detection
+                        amt_parts.append(t)
+                    amt_text = " ".join(amt_parts)
+
+                    # Prepend + if credit so the LLM sees it clearly
+                    if is_credit:
+                        col_texts.append("+" + amt_text)
+                    else:
+                        col_texts.append(amt_text)
+                else:
+                    col_texts.append(" ".join(w["text"] for w in col_words))
+
             row_text = " | ".join(col_texts)
             row_lower = row_text.lower()
 
@@ -483,13 +534,6 @@ def build_rows(ocr_pages: list[dict]) -> tuple[list[str], list[float]]:
             # Must contain a date pattern
             if not _DATE_RE.search(row_text):
                 continue
-
-            # Credit detection: geometric welding or standalone '+'
-            has_plus = any(w.get("has_plus_prefix") for w in row_words)
-            if not has_plus:
-                has_plus = any(w["text"].strip() == "+" for w in row_words)
-            if has_plus:
-                row_text = "[CREDIT] " + row_text
 
             all_rows.append(row_text)
             avg_conf = sum(w["confidence"] for w in row_words) / len(row_words)
@@ -555,7 +599,7 @@ def parse_rows_with_llm(rows: list[str]) -> list[dict]:
 
     all_transactions = []
     debug_log = []
-    chunk_size = 15  # small chunks for 3B model
+    chunk_size = 30  # bigger chunks = fewer LLM calls
 
     st.session_state["qwen_input_rows"] = rows
 
@@ -564,27 +608,29 @@ def parse_rows_with_llm(rows: list[str]) -> list[dict]:
         rows_text = "\n".join(f"ROW{i+1}: {r}" for i, r in enumerate(chunk))
 
         prompt = (
-            "You are a credit card statement parser. Below are OCR rows from a scanned statement.\n"
-            "Each row has columns separated by |. The columns are: date, time, description, amount.\n"
-            "Some rows may have extra columns (foreign currency for international transactions).\n\n"
+            "Parse these credit card statement rows into JSON.\n"
+            "Each row: date | description columns | amount (rightmost column)\n\n"
             "RULES:\n"
-            "- date: Convert to YYYY-MM-DD format (input is DD/MM/YYYY)\n"
-            "- description: The merchant/vendor name and location\n"
-            "- amount: The LAST numeric column with decimals is the INR amount. "
-            "Remove commas. Keep exactly 2 decimal places. Do NOT change the number.\n"
-            "- type: If the row starts with [CREDIT], type is 'credit'. Otherwise 'debit'.\n"
-            "- IGNORE rows that are GST/IGST tax entries, totals, or fees\n"
-            "- For international rows with foreign currency (THB, USD etc), "
-            "the INR amount is always the LAST number column\n\n"
-            "Return ONLY a valid JSON array. No explanation.\n"
-            'Example: [{"date":"2026-02-25","description":"MAKE MY TRIP","amount":7627.00,"type":"debit"}]\n\n'
-            f"Parse these rows:\n{rows_text}"
+            "- date: DD/MM/YYYY → YYYY-MM-DD\n"
+            "- description: Extract the MERCHANT/VENDOR NAME only. "
+            "Remove ref IDs, (Ref# ...), timestamps, HTTPS URLs, IGST codes.\n"
+            "- amount: The RIGHTMOST column is the INR amount. "
+            "If it starts with + it is CREDIT, else DEBIT. "
+            "Remove commas and + sign. Return as float.\n"
+            "- Skip IGST/GST/tax/surcharge/fee rows entirely.\n\n"
+            "Examples:\n"
+            'ROW: 25/02/2026 | 14:06 MAKE MY TRIP INDIA PVT L | 7,627.00\n'
+            '→ {"date":"2026-02-25","description":"MAKE MY TRIP INDIA PVT L","amount":7627.00,"type":"debit"}\n'
+            'ROW: 27/01/2026 | 00:00 IRCTC MPP NEW DELHI | +3,598.26\n'
+            '→ {"date":"2026-01-27","description":"IRCTC MPP NEW DELHI","amount":3598.26,"type":"credit"}\n\n'
+            "Return ONLY a JSON array.\n\n"
+            f"{rows_text}"
         )
 
         parsed = None
         raw_text = ""
 
-        for attempt in range(2):
+        for attempt in range(1):
             try:
                 resp = requests.post(
                     f"{ollama_url}/api/generate",
@@ -592,7 +638,7 @@ def parse_rows_with_llm(rows: list[str]) -> list[dict]:
                         "model": ollama_model,
                         "prompt": prompt,
                         "stream": False,
-                        "options": {"temperature": 0.1, "num_predict": 2000},
+                        "options": {"temperature": 0.1, "num_predict": 1500, "num_ctx": 4096},
                     },
                     timeout=120,
                 )
@@ -663,14 +709,20 @@ def parse_rows_fast(rows: list[str]) -> list[dict]:
         , re.IGNORECASE
     )
     _AMOUNT_RE = re.compile(r"[+\-]?\d[\d,]*\.\d{1,2}")
+    # ₹-prefixed amount: optional + before ₹, then the number
+    _RUPEE_AMOUNT_RE = re.compile(r"(\+)?\s*[₹]\s*(\d[\d,]*\.\d{1,2})")
+    # Foreign currency codes to skip
+    _FOREIGN_CUR_RE = re.compile(r"\b(THB|USD|EUR|GBP|AED|SGD|JPY)\s+\d", re.IGNORECASE)
 
     transactions = []
     debug_log = []
     st.session_state["qwen_input_rows"] = rows
 
     for row_str in rows:
-        is_credit = row_str.startswith("[CREDIT]")
-        text = row_str.replace("[CREDIT] ", "").strip()
+        text = row_str.strip()
+        # Credit: the rightmost amount column starts with +
+        # build_rows already prepends + to the amount column
+        is_credit = False
 
         date_match = _DATE_RE.search(text)
         if not date_match:
@@ -678,23 +730,47 @@ def parse_rows_fast(rows: list[str]) -> list[dict]:
             continue
 
         date_normalized = _normalize_date(date_match.group(0))
-        amounts = list(_AMOUNT_RE.finditer(text))
-        if not amounts:
-            debug_log.append({"row": row_str[:80], "status": "SKIP (no amount)"})
-            continue
 
-        last_amt = amounts[-1]
-        amount_clean = last_amt.group(0).lstrip("+-").replace(",", "")
-        try:
-            amount_val = round(float(amount_clean), 2)
-        except ValueError:
-            continue
+        # Priority 1: look for ₹-prefixed amount (the INR amount we want)
+        rupee_match = _RUPEE_AMOUNT_RE.search(text)
+        if rupee_match:
+            if rupee_match.group(1) == "+":
+                is_credit = True
+            amount_clean = rupee_match.group(2).replace(",", "")
+            try:
+                amount_val = round(float(amount_clean), 2)
+            except ValueError:
+                amount_val = 0.0
+            desc = text[date_match.end():rupee_match.start()].strip()
+        else:
+            # Priority 2: last decimal number, but skip foreign currency amounts
+            amounts = list(_AMOUNT_RE.finditer(text))
+            if not amounts:
+                debug_log.append({"row": row_str[:80], "status": "SKIP (no amount)"})
+                continue
 
-        desc = text[date_match.end():last_amt.start()].strip()
+            # Filter out amounts that are preceded by foreign currency codes
+            inr_amounts = []
+            for m in amounts:
+                before_text = text[max(0, m.start() - 5):m.start()]
+                if not _FOREIGN_CUR_RE.search(before_text):
+                    inr_amounts.append(m)
+
+            # Use filtered INR amounts if any, otherwise fall back to all
+            chosen_amounts = inr_amounts if inr_amounts else amounts
+            last_amt = chosen_amounts[-1]
+
+            amount_clean = last_amt.group(0).lstrip("+-").replace(",", "")
+            try:
+                amount_val = round(float(amount_clean), 2)
+            except ValueError:
+                continue
+            desc = text[date_match.end():last_amt.start()].strip()
+
+            if not is_credit and last_amt.group(0).startswith("+"):
+                is_credit = True
+
         desc = re.sub(r"^\d{1,2}:\d{2}\s*", "", desc).strip(" |-")
-
-        if not is_credit and last_amt.group(0).startswith("+"):
-            is_credit = True
 
         transactions.append({
             "date": date_normalized,
