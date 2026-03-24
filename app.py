@@ -1954,14 +1954,13 @@ def _sync_edits_back(edited_df: pd.DataFrame, orig_indices):
 # Main area: 5 Tabs
 # ---------------------------------------------------------------------------
 
-tab_high, tab_review, tab_unmatched, tab_credits, tab_compare, tab_ocr_debug = st.tabs(
+tab_high, tab_review, tab_unmatched, tab_credits, tab_compare = st.tabs(
     [
         "Auto-Approved",
         "Needs Review",
         "Unmatched",
         "Credits",
         "Receipt vs Transaction",
-        "OCR Debug",
     ]
 )
 
@@ -2461,208 +2460,54 @@ with tab_compare:
     else:
         st.info("Run processing to see receipt vs transaction comparisons here.")
 
-    # ── Pipeline Debug Section — always shown if data exists ──
+    # ── Statement Parsed Output (table) ──
     st.markdown("---")
-    st.markdown("## Pipeline Debug")
-
-    # Debug 1: Raw OCR rows sent to LLM
-    _qwen_rows = st.session_state.get("qwen_input_rows")
-    if _qwen_rows:
-        with st.expander(f"1. OCR Rows sent to LLM ({len(_qwen_rows)} rows)", expanded=False):
-            for i, r in enumerate(_qwen_rows):
-                st.text(f"  [{i:2d}] {r}")
-
-    # Debug 2: Row parse status
-    _qwen_debug = st.session_state.get("qwen_debug")
-    if _qwen_debug:
-        with st.expander("2. Row Parse Status", expanded=True):
-            n_ok = sum(1 for e in _qwen_debug if e.get("status") == "OK")
-            n_skip = len(_qwen_debug) - n_ok
-            st.caption(f"{n_ok} parsed, {n_skip} skipped")
-            for entry in _qwen_debug:
-                if entry.get("status") == "OK":
-                    st.success(f"{entry.get('row', '?')}")
-                else:
-                    st.warning(f"{entry.get('row', '?')} — {entry.get('status', 'SKIP')}")
-
-    # Debug 3: Parsed output (before validation)
-    _qwen_raw = st.session_state.get("qwen_raw_output")
-    if _qwen_raw:
-        with st.expander(f"3. Parsed Output ({len(_qwen_raw)} transactions before validation)", expanded=False):
-            df_raw = pd.DataFrame(_qwen_raw)
-            st.dataframe(df_raw, width="stretch", hide_index=True)
-    elif _qwen_rows:
-        st.error("Parser returned 0 transactions. Check OCR debug output for row reconstruction issues.")
-
-    # Debug 4: Validation results (what was kept/rejected and why)
-    _val_debug = st.session_state.get("validation_debug")
-    if _val_debug:
-        with st.expander(f"4. Validation Results ({sum(1 for v in _val_debug if v['kept'])}/{len(_val_debug)} kept)", expanded=True):
-            df_val = pd.DataFrame(_val_debug)
-            # Highlight rejected rows
-            st.dataframe(df_val, width="stretch", hide_index=True)
-            rejected = [v for v in _val_debug if not v["kept"]]
-            if rejected:
-                st.warning(f"{len(rejected)} row(s) rejected:")
-                for r in rejected:
-                    st.caption(f"  Row {r['idx']}: {r['desc']} — {r['issues']} (score={r['final_score']})")
-
-    # Debug 5: Final validated transactions
-    if _df_statements is not None:
-        with st.expander(f"5. Final Validated Transactions ({len(_df_statements)} rows)", expanded=False):
-            if not _df_statements.empty:
-                st.dataframe(_df_statements, width="stretch", hide_index=True)
-            else:
-                st.error("0 transactions survived validation. Check steps 2-4 above.")
-
-# ---------------------------------------------------------------------------
-# Tab 6: OCR Debug — raw OCR text + image for every receipt
-# ---------------------------------------------------------------------------
-with tab_ocr_debug:
-    st.subheader("Receipt Debug")
-    st.caption("Shows Qwen VLM extraction results for each receipt image.")
-
-    _receipt_debug_all = st.session_state.get("debug_receipt_ocr", {})
-
-    if _receipt_debug_all:
-        # ── Summary table: Qwen VLM JSON output for all receipts ──
-        st.markdown("### Qwen VLM Output (all receipts)")
-        _vlm_table_rows = []
-        for rname, rdbg in _receipt_debug_all.items():
-            llm = rdbg.get("llm_raw") or {}
-            _vlm_table_rows.append({
-                "Receipt": rname,
-                "Status": rdbg.get("status", "failed"),
-                "VLM Vendor": llm.get("vendor") or rdbg.get("vendor") or "—",
-                "VLM Amount": llm.get("amount") or rdbg.get("amount") or "—",
-                "VLM Date": llm.get("date") or rdbg.get("date") or "—",
-                "Confidence": f"{rdbg.get('confidence', 0.0):.0%}",
-                "Source": "VLM" if rdbg.get("llm_raw") else "Regex fallback",
-            })
-        st.dataframe(pd.DataFrame(_vlm_table_rows), width="stretch", hide_index=True)
-
-        st.markdown("---")
-
-        # ── Per-receipt detail ──
-        for receipt_name, dbg in _receipt_debug_all.items():
-            img_path = UPLOAD_DIR_RECEIPTS / receipt_name
-
-            status = dbg.get("status", "failed")
-            confidence = dbg.get("confidence", 0.0)
-            if status == "success" and confidence >= 0.55:
-                status_badge = f":green[{status}]"
-            elif status == "success":
-                status_badge = f":orange[{status} (low confidence)]"
-            else:
-                status_badge = f":red[{status}]"
-
-            st.markdown(
-                f"#### {receipt_name}  —  {status_badge}  "
-                f"(confidence: **{confidence:.2%}**)"
-            )
-
-            col_img, col_result = st.columns([1, 2])
-
-            with col_img:
-                if img_path.exists():
-                    st.image(_load_image_fixed(img_path), caption=receipt_name,
-                             use_container_width=True)
-                else:
-                    st.warning("Image not found on disk.")
-
-            with col_result:
-                # Show final extracted fields
-                st.markdown("**Extracted Fields:**")
-                st.markdown(
-                    f"**Vendor:** {dbg.get('vendor') or '—'}  \n"
-                    f"**Amount:** {dbg.get('amount') or '—'}  \n"
-                    f"**Date:** {dbg.get('date') or '—'}"
-                )
-
-                # Show VLM JSON response
-                llm_raw = dbg.get("llm_raw")
-                st.markdown("---")
-                st.markdown("**Qwen VLM JSON response:**")
-                if llm_raw:
-                    st.json(llm_raw)
-                else:
-                    st.caption("VLM returned nothing — used regex fallback")
-
-                # Show regex fallback if it was used
-                if not llm_raw:
-                    st.markdown("**Regex fallback:**")
-                    st.markdown(
-                        f"Vendor: `{dbg.get('regex_vendor') or '—'}`  \n"
-                        f"Amount: `{dbg.get('regex_amount') or '—'}`  \n"
-                        f"Date: `{dbg.get('regex_date') or '—'}`"
-                    )
-
-                # Show raw OCR text only if OCR was used (not VLM)
-                raw_text = dbg.get("raw_text", "")
-                is_vlm = raw_text.startswith("[VLM direct")
-                if not is_vlm and raw_text:
-                    with st.expander("Raw OCR Text (fallback)", expanded=False):
-                        st.text_area(
-                            "OCR Output",
-                            value=raw_text,
-                            height=300,
-                            key=f"ocr_debug_{receipt_name}",
-                            disabled=True,
-                        )
-
-            st.divider()
-    else:
-        st.info("Run processing to see receipt debug output.")
-
-    # ── Statement Debug ──
-    st.markdown("---")
-    st.subheader("Statement Debug")
-
-    # Page-level layout info
-    _layout_debug = st.session_state.get("debug_row_layouts", [])
-    if _layout_debug:
-        st.markdown("**Page Layout**")
-        st.dataframe(pd.DataFrame(_layout_debug), hide_index=True)
-
-    # Row-level word debug (first page)
-    _word_debug = st.session_state.get("debug_row_words", [])
-    if _word_debug:
-        with st.expander(f"Row-level word zones ({len(_word_debug)} rows)", expanded=False):
-            for rd in _word_debug:
-                status = rd.get("status", "")
-                color = "green" if "KEPT" in status else "red" if "SKIP" in status else "gray"
-                st.markdown(f":{color}[Row {rd.get('row', '?')}]: {status}")
-                if rd.get("words"):
-                    st.caption(" | ".join(
-                        f"{w.get('text', '')}({w.get('zone', '?')})"
-                        for w in rd["words"][:15]
-                    ))
-
-    # Reconstructed rows (input to parser)
-    _input_rows = st.session_state.get("qwen_input_rows", [])
-    if _input_rows:
-        st.markdown(f"**Reconstructed Rows ({len(_input_rows)})**")
-        for i, r in enumerate(_input_rows):
-            st.text(f"{i+1:3d}. {r}")
-
-    # Parsed transactions (output)
+    st.subheader("Parsed Statement Transactions")
     _parsed_txns = st.session_state.get("qwen_raw_output", [])
     if _parsed_txns:
-        st.markdown(f"**Parsed Transactions ({len(_parsed_txns)})**")
         st.dataframe(pd.DataFrame(_parsed_txns), hide_index=True, use_container_width=True)
+    elif _df_statements is not None and not _df_statements.empty:
+        st.dataframe(_df_statements, hide_index=True, use_container_width=True)
+    else:
+        st.info("Process a statement to see parsed transactions here.")
 
-    # Credit debug
-    _credit_debug = st.session_state.get("debug_credit_rows", [])
-    if _credit_debug:
-        st.markdown(f"**Credit Rows Detected ({len(_credit_debug)})**")
-        for idx, row_str in _credit_debug:
-            st.text(f"  Row {idx}: {row_str}")
+    # ── Receipt OCR Debug ──
+    st.markdown("---")
+    st.subheader("Receipt OCR Debug")
+    _receipt_debug_all = st.session_state.get("debug_receipt_ocr", {})
+    if _receipt_debug_all:
+        # Summary table
+        _debug_rows = []
+        for rname, rdbg in _receipt_debug_all.items():
+            _debug_rows.append({
+                "Receipt": rname,
+                "Status": rdbg.get("status", "failed"),
+                "Vendor": rdbg.get("vendor") or "—",
+                "Amount": rdbg.get("amount") or "—",
+                "Date": rdbg.get("date") or "—",
+                "Confidence": f"{rdbg.get('confidence', 0.0):.0%}",
+            })
+        st.dataframe(pd.DataFrame(_debug_rows), width="stretch", hide_index=True)
 
-    # Validation debug
-    _val_debug = st.session_state.get("validation_debug", [])
-    if _val_debug:
-        with st.expander(f"Validation Details ({len(_val_debug)} rows)", expanded=False):
-            st.dataframe(pd.DataFrame(_val_debug), hide_index=True, use_container_width=True)
-
-    if not _input_rows and not _layout_debug:
-        st.info("Upload a statement and click Process to see debug output.")
+        # Per-receipt detail
+        for receipt_name, dbg in _receipt_debug_all.items():
+            img_path = UPLOAD_DIR_RECEIPTS / receipt_name
+            with st.expander(f"{receipt_name} — {dbg.get('status', 'failed')}"):
+                col_img, col_result = st.columns([1, 2])
+                with col_img:
+                    if img_path.exists():
+                        st.image(_load_image_fixed(img_path), caption=receipt_name,
+                                 use_container_width=True)
+                with col_result:
+                    st.markdown(
+                        f"**Vendor:** {dbg.get('vendor') or '—'}  \n"
+                        f"**Amount:** {dbg.get('amount') or '—'}  \n"
+                        f"**Date:** {dbg.get('date') or '—'}  \n"
+                        f"**Confidence:** {dbg.get('confidence', 0.0):.0%}"
+                    )
+                    raw_text = dbg.get("raw_text", "")
+                    if raw_text:
+                        st.text_area("Raw Output", value=raw_text, height=150,
+                                     key=f"ocr_debug_{receipt_name}", disabled=True)
+    else:
+        st.info("Process receipts to see OCR debug output.")
