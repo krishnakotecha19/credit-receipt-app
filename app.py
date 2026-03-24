@@ -1482,27 +1482,23 @@ with st.sidebar:
 
     st.divider()
 
-    # Process buttons
-    col_proc, col_online, col_clear = st.columns([2, 2, 1])
-    with col_proc:
-        process_clicked = st.button("Process", type="primary", use_container_width=True)
-    with col_online:
-        process_online_clicked = st.button("Process Online", type="secondary", use_container_width=True)
-    with col_clear:
-        if st.button("Clear Cache", use_container_width=True):
-            # Wipe all cached state so next Process runs fresh
-            for k in _PERSIST_DF_KEYS + _PERSIST_SCALAR_KEYS:
-                st.session_state.pop(k, None)
-            for k in ["qwen_input_rows", "qwen_debug", "qwen_raw_output",
-                       "debug_qwen_credits", "validation_debug",
-                       "statement_pages", "debug_row_layouts",
-                       "debug_row_words", "debug_credit_rows"]:
-                st.session_state.pop(k, None)
-            _SESSION_CACHE_FILE.unlink(missing_ok=True)
-            # Clear statement JSON cache too
-            for f in CACHE_DIR_STATEMENTS.glob("*.json"):
-                f.unlink(missing_ok=True)
-            st.rerun()
+    # Process buttons — stacked vertically: Process, Process Online, Clear Cache
+    process_clicked = st.button("Process", type="primary", use_container_width=True)
+    process_online_clicked = st.button("Process Online", type="secondary", use_container_width=True)
+    if st.button("Clear Cache", use_container_width=True):
+        # Wipe all cached state so next Process runs fresh
+        for k in _PERSIST_DF_KEYS + _PERSIST_SCALAR_KEYS:
+            st.session_state.pop(k, None)
+        for k in ["qwen_input_rows", "qwen_debug", "qwen_raw_output",
+                   "debug_qwen_credits", "validation_debug",
+                   "statement_pages", "debug_row_layouts",
+                   "debug_row_words", "debug_credit_rows"]:
+            st.session_state.pop(k, None)
+        _SESSION_CACHE_FILE.unlink(missing_ok=True)
+        # Clear statement JSON cache too
+        for f in CACHE_DIR_STATEMENTS.glob("*.json"):
+            f.unlink(missing_ok=True)
+        st.rerun()
 
 # ---- Save uploaded files to disk & process ONLY when Process is clicked ----
 receipt_files = []
