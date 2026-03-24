@@ -2247,16 +2247,56 @@ with tab_compare:
     else:
         st.info("Run processing to see receipt vs transaction comparisons here.")
 
-    # ── Statement Parsed Output (table) ──
+    # ── Statement Debug: OCR Raw Rows → Parsed Result side by side ──
     st.markdown("---")
-    st.subheader("Parsed Statement Transactions")
+    st.subheader("Statement Debug")
+
+    _ocr_rows = st.session_state.get("qwen_input_rows", [])
     _parsed_txns = st.session_state.get("qwen_raw_output", [])
-    if _parsed_txns:
-        st.dataframe(pd.DataFrame(_parsed_txns), hide_index=True, use_container_width=True)
+
+    if _ocr_rows or _parsed_txns:
+        # Show OCR raw rows (what build_rows produced)
+        with st.expander(f"OCR Raw Rows ({len(_ocr_rows)} rows)", expanded=False):
+            if _ocr_rows:
+                for i, r in enumerate(_ocr_rows):
+                    st.text(f"{i + 1:3d}. {r}")
+            else:
+                st.info("No OCR rows.")
+
+        # Show parsed result (what regex extracted)
+        st.markdown(f"**Parsed Transactions ({len(_parsed_txns)})**")
+        if _parsed_txns:
+            st.dataframe(pd.DataFrame(_parsed_txns), hide_index=True, use_container_width=True)
+        else:
+            st.info("No transactions parsed.")
+
+        # Side-by-side comparison: raw row vs parsed
+        with st.expander("Row-by-Row Comparison (OCR vs Parsed)", expanded=True):
+            parse_idx = 0
+            for i, raw_row in enumerate(_ocr_rows):
+                if parse_idx < len(_parsed_txns):
+                    p = _parsed_txns[parse_idx]
+                    st.markdown(
+                        f"**Row {i + 1}**  \n"
+                        f"OCR: `{raw_row[:100]}`  \n"
+                        f"→ Date: `{p.get('date', '')}` | "
+                        f"Desc: `{p.get('description', '')[:50]}` | "
+                        f"Amt: `{p.get('amount', '')}` | "
+                        f"Type: `{p.get('type', '')}`"
+                    )
+                    parse_idx += 1
+                else:
+                    st.markdown(
+                        f"**Row {i + 1}**  \n"
+                        f"OCR: `{raw_row[:100]}`  \n"
+                        f"→ *SKIPPED by parser*"
+                    )
+                st.markdown("---")
     elif _df_statements is not None and not _df_statements.empty:
+        st.markdown("**Final Statement Transactions**")
         st.dataframe(_df_statements, hide_index=True, use_container_width=True)
     else:
-        st.info("Process a statement to see parsed transactions here.")
+        st.info("Process a statement to see debug output here.")
 
     # ── Receipt OCR Debug ──
     st.markdown("---")
