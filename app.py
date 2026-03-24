@@ -368,16 +368,14 @@ _restore_session_state()
 
 
 def build_rows(ocr_pages: list[dict]) -> tuple[list[str], list[float]]:
-    """Reconstruct table rows from raw OCR words.
+    """Reconstruct table rows from raw OCR words with column structure.
 
-    Simple approach:
-      1. Cluster words into rows by Y proximity (adaptive threshold)
-      2. Sort each row's words left-to-right by X
-      3. Join words into a single raw text string
-      4. Skip obvious header/junk rows
-      5. Let parse_rows_fast() handle date/desc/amount extraction via regex
-
-    No zone cutoffs, no amount detection here — just raw row text.
+    1. Cluster words into rows by Y proximity (adaptive threshold)
+    2. Sort each row's words left-to-right by X
+    3. Detect column breaks using X gaps between consecutive words
+    4. Output each row as "col1 | col2 | col3 | ..." with columns
+       separated by pipe, so the LLM can see the table structure
+    5. Skip obvious header/junk rows
 
     Returns:
         Tuple of (row_strings, ocr_confidences).
@@ -438,37 +436,62 @@ def build_rows(ocr_pages: list[dict]) -> tuple[list[str], list[float]]:
                 current_row = [w]
         rows_clustered.append(current_row)
 
-        # Process each row
+        # Compute median word gap on this page to detect column breaks
+        all_x_gaps = []
         for row_words in rows_clustered:
-            # Sort left to right
+            row_words.sort(key=lambda w: w["center_x"])
+            for j in range(1, len(row_words)):
+                gap = row_words[j]["x_min"] - row_words[j - 1]["x_max"]
+                if gap > 0:
+                    all_x_gaps.append(gap)
+        if all_x_gaps:
+            all_x_gaps.sort()
+            median_gap = all_x_gaps[len(all_x_gaps) // 2]
+            col_gap_threshold = max(median_gap * 3, 0.03)
+        else:
+            col_gap_threshold = 0.05
+
+        # Process each row — split into columns at big X gaps
+        for row_words in rows_clustered:
             row_words.sort(key=lambda w: w["center_x"])
 
-            # Join all words into raw text
-            raw_text = " ".join(w["text"] for w in row_words)
-            raw_lower = raw_text.lower()
-
-            # Skip obvious headers
-            if any(hw in raw_lower for hw in _HEADER_WORDS):
-                continue
-
-            # Skip rows with fewer than 2 words
+            # Skip too few words
             if len(row_words) < 2:
                 continue
 
-            # Must contain a date pattern to be a transaction row
-            if not _DATE_RE.search(raw_text):
+            # Build columns by detecting X gaps
+            columns = []
+            current_col_words = [row_words[0]]
+            for j in range(1, len(row_words)):
+                gap = row_words[j]["x_min"] - row_words[j - 1]["x_max"]
+                if gap > col_gap_threshold:
+                    columns.append(current_col_words)
+                    current_col_words = [row_words[j]]
+                else:
+                    current_col_words.append(row_words[j])
+            columns.append(current_col_words)
+
+            # Join words within each column, then join columns with |
+            col_texts = [" ".join(w["text"] for w in col) for col in columns]
+            row_text = " | ".join(col_texts)
+            row_lower = row_text.lower()
+
+            # Skip headers
+            if any(hw in row_lower for hw in _HEADER_WORDS):
                 continue
 
-            # Check for geometric welding '+' on any word (credit marker)
+            # Must contain a date pattern
+            if not _DATE_RE.search(row_text):
+                continue
+
+            # Credit detection: geometric welding or standalone '+'
             has_plus = any(w.get("has_plus_prefix") for w in row_words)
-            # Also check for standalone '+' token anywhere in the row
             if not has_plus:
                 has_plus = any(w["text"].strip() == "+" for w in row_words)
-
             if has_plus:
-                raw_text = "+" + raw_text
+                row_text = "[CREDIT] " + row_text
 
-            all_rows.append(raw_text)
+            all_rows.append(row_text)
             avg_conf = sum(w["confidence"] for w in row_words) / len(row_words)
             all_confs.append(avg_conf)
 
@@ -514,99 +537,175 @@ def _normalize_date(date_str: str) -> str:
     return ""
 
 
-def parse_rows_fast(rows: list[str]) -> list[dict]:
-    """Parse raw OCR row text into structured JSON using regex.
+def parse_rows_with_llm(rows: list[str]) -> list[dict]:
+    """Send column-structured OCR rows to local Qwen 3B for parsing.
 
-    Input: raw row text like "25/02/2026 15:40 ING*MAKE MY TRIP 7,627.00"
-    Output: {date, description, amount, type}
+    Input rows look like: "25/02/2026 | 15:40 ING*MAKE MY TRIP | 7,627.00"
+    Columns are separated by | based on X-gap detection in build_rows.
+    [CREDIT] prefix means the amount has a + sign.
 
-    Logic:
-      1. Detect credit: row starts with '+' → credit, strip the '+'
-      2. Find FIRST date pattern → date
-      3. Find LAST amount pattern (number with decimal, rightmost) → amount
-      4. Everything between date and amount → description
-      5. Amount is preserved exactly as OCR produced, just cleaned of commas
+    The LLM sees the table structure and extracts date, description, amount.
+    Sent in chunks of 15 rows to keep context small for 3B model.
 
     Returns:
         List of dicts: date, description, amount, type.
     """
+    ollama_url = os.environ.get("OLLAMA_URL", "http://localhost:11434")
+    ollama_model = os.environ.get("OLLAMA_MODEL", "qwen2.5:3b")
+
+    all_transactions = []
+    debug_log = []
+    chunk_size = 15  # small chunks for 3B model
+
+    st.session_state["qwen_input_rows"] = rows
+
+    for chunk_start in range(0, len(rows), chunk_size):
+        chunk = rows[chunk_start:chunk_start + chunk_size]
+        rows_text = "\n".join(f"ROW{i+1}: {r}" for i, r in enumerate(chunk))
+
+        prompt = (
+            "You are a credit card statement parser. Below are OCR rows from a scanned statement.\n"
+            "Each row has columns separated by |. The columns are: date, time, description, amount.\n"
+            "Some rows may have extra columns (foreign currency for international transactions).\n\n"
+            "RULES:\n"
+            "- date: Convert to YYYY-MM-DD format (input is DD/MM/YYYY)\n"
+            "- description: The merchant/vendor name and location\n"
+            "- amount: The LAST numeric column with decimals is the INR amount. "
+            "Remove commas. Keep exactly 2 decimal places. Do NOT change the number.\n"
+            "- type: If the row starts with [CREDIT], type is 'credit'. Otherwise 'debit'.\n"
+            "- IGNORE rows that are GST/IGST tax entries, totals, or fees\n"
+            "- For international rows with foreign currency (THB, USD etc), "
+            "the INR amount is always the LAST number column\n\n"
+            "Return ONLY a valid JSON array. No explanation.\n"
+            'Example: [{"date":"2026-02-25","description":"MAKE MY TRIP","amount":7627.00,"type":"debit"}]\n\n'
+            f"Parse these rows:\n{rows_text}"
+        )
+
+        parsed = None
+        raw_text = ""
+
+        for attempt in range(2):
+            try:
+                resp = requests.post(
+                    f"{ollama_url}/api/generate",
+                    json={
+                        "model": ollama_model,
+                        "prompt": prompt,
+                        "stream": False,
+                        "options": {"temperature": 0.1, "num_predict": 2000},
+                    },
+                    timeout=120,
+                )
+                if resp.status_code != 200:
+                    continue
+
+                raw_text = resp.json().get("response", "")
+                if not raw_text:
+                    continue
+
+                cleaned = raw_text.strip()
+                if cleaned.startswith("```"):
+                    cleaned = re.sub(r"^```(?:json)?\s*", "", cleaned)
+                    cleaned = re.sub(r"\s*```$", "", cleaned)
+                arr_match = re.search(r'\[.*\]', cleaned, re.DOTALL)
+                if arr_match:
+                    cleaned = arr_match.group(0)
+
+                parsed = json.loads(cleaned)
+                break
+            except (json.JSONDecodeError, KeyError, ValueError):
+                continue
+            except requests.RequestException as e:
+                debug_log.append({
+                    "row": f"Chunk {chunk_start+1}-{chunk_start+len(chunk)}",
+                    "status": f"CONNECTION ERROR: {e}"
+                })
+                break
+
+        if parsed and isinstance(parsed, list):
+            for txn in parsed:
+                if isinstance(txn, dict) and txn.get("amount"):
+                    try:
+                        amt = round(float(txn.get("amount", 0)), 2)
+                    except (ValueError, TypeError):
+                        amt = 0.0
+                    if amt > 0:
+                        all_transactions.append({
+                            "date": txn.get("date", ""),
+                            "description": txn.get("description", ""),
+                            "amount": amt,
+                            "type": txn.get("type", "debit"),
+                        })
+            debug_log.append({
+                "row": f"Chunk {chunk_start+1}-{chunk_start+len(chunk)}",
+                "status": f"OK ({len(parsed)} parsed)"
+            })
+        else:
+            debug_log.append({
+                "row": f"Chunk {chunk_start+1}-{chunk_start+len(chunk)}",
+                "status": f"FAILED: {raw_text[:100]}"
+            })
+
+    st.session_state["qwen_debug"] = debug_log
+    st.session_state["qwen_raw_output"] = all_transactions
+    return all_transactions
+
+
+def parse_rows_fast(rows: list[str]) -> list[dict]:
+    """Regex fallback parser — used when Ollama is not available.
+
+    Extracts date (first date pattern), amount (last decimal number),
+    description (everything in between) from column-structured rows.
+    """
     _DATE_RE = re.compile(
         r"\d{2}[/\-]\d{2}[/\-]\d{2,4}"
         r"|\d{4}[/\-]\d{2}[/\-]\d{2}"
-        r"|\d{1,2}\s+(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)[a-z]*\s*\d{2,4}"
         , re.IGNORECASE
     )
-    # Amount pattern: optional sign, digits with commas, decimal with 1-2 digits
-    # Must have a decimal point to distinguish from IDs/phone numbers
     _AMOUNT_RE = re.compile(r"[+\-]?\d[\d,]*\.\d{1,2}")
 
     transactions = []
     debug_log = []
-
     st.session_state["qwen_input_rows"] = rows
 
     for row_str in rows:
-        # 1. Credit detection: '+' at start means credit (build_rows prepends it)
-        is_credit = row_str.startswith("+")
-        text = row_str.lstrip("+").strip()
+        is_credit = row_str.startswith("[CREDIT]")
+        text = row_str.replace("[CREDIT] ", "").strip()
 
-        # 2. Find the FIRST date in the row
         date_match = _DATE_RE.search(text)
         if not date_match:
             debug_log.append({"row": row_str[:80], "status": "SKIP (no date)"})
             continue
 
-        date_raw = date_match.group(0)
-        date_normalized = _normalize_date(date_raw)
-        date_end = date_match.end()
-
-        # 3. Find ALL amounts in the row, take the LAST one (rightmost = actual amount)
+        date_normalized = _normalize_date(date_match.group(0))
         amounts = list(_AMOUNT_RE.finditer(text))
         if not amounts:
             debug_log.append({"row": row_str[:80], "status": "SKIP (no amount)"})
             continue
 
-        last_amount_match = amounts[-1]
-        amount_raw = last_amount_match.group(0)
-        amount_start = last_amount_match.start()
-
-        # Check if this amount is credit: '+' in the matched amount itself,
-        # or '+' in the 2 chars before it
-        if not is_credit:
-            if amount_raw.startswith("+"):
-                is_credit = True
-            elif amount_start > 0:
-                before = text[max(0, amount_start - 2):amount_start].strip()
-                if "+" in before:
-                    is_credit = True
-
-        # Clean amount: strip +/-, remove commas, parse as float
-        amount_clean = amount_raw.lstrip("+-").replace(",", "")
+        last_amt = amounts[-1]
+        amount_clean = last_amt.group(0).lstrip("+-").replace(",", "")
         try:
             amount_val = round(float(amount_clean), 2)
         except ValueError:
-            debug_log.append({"row": row_str[:80], "status": "SKIP (bad amount)"})
             continue
 
-        # 4. Description = everything between date end and amount start
-        desc = text[date_end:amount_start].strip()
-        # Clean up: remove leading/trailing time patterns, junk
-        desc = re.sub(r"^\d{1,2}:\d{2}\s*", "", desc)  # strip leading time HH:MM
-        desc = desc.strip(" |-")
+        desc = text[date_match.end():last_amt.start()].strip()
+        desc = re.sub(r"^\d{1,2}:\d{2}\s*", "", desc).strip(" |-")
 
-        txn_type = "credit" if is_credit else "debit"
+        if not is_credit and last_amt.group(0).startswith("+"):
+            is_credit = True
 
         transactions.append({
             "date": date_normalized,
             "description": desc,
             "amount": amount_val,
-            "type": txn_type,
+            "type": "credit" if is_credit else "debit",
         })
         debug_log.append({"row": row_str[:80], "status": "OK"})
 
     st.session_state["qwen_debug"] = debug_log
     st.session_state["qwen_raw_output"] = transactions
-
     return transactions
 
 
@@ -1409,9 +1508,16 @@ if process_clicked:
             st.sidebar.warning("  → 0 rows with +/CR found in OCR output")
 
         if rows:
-            # Step 2c: Parse rows into structured transactions (fast regex — no LLM)
-            st.sidebar.info(f"Step 2c — Parsing {len(rows)} rows…")
-            qwen_output = parse_rows_fast(rows)
+            # Step 2c: Parse rows — try LLM first (accurate), fall back to regex
+            st.sidebar.info(f"Step 2c — Parsing {len(rows)} rows via Qwen…")
+            try:
+                qwen_output = parse_rows_with_llm(rows)
+                if not qwen_output:
+                    st.sidebar.warning("LLM returned 0 results, falling back to regex…")
+                    qwen_output = parse_rows_fast(rows)
+            except Exception as e:
+                st.sidebar.warning(f"LLM failed ({e}), falling back to regex…")
+                qwen_output = parse_rows_fast(rows)
 
             # DEBUG: Show credit/debit breakdown
             qwen_credits = [

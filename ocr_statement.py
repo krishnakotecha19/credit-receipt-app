@@ -88,7 +88,7 @@ def process_statement_pdf(pdf_path: str, poppler_path: str = None) -> list[dict]
 
     pages_out = []
     try:
-        kwargs = {"dpi": 250}
+        kwargs = {"dpi": 350}
         if poppler_path:
             kwargs["poppler_path"] = poppler_path
         pil_images = convert_from_path(pdf_path, **kwargs)
