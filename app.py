@@ -732,71 +732,78 @@ def _normalize_date(date_str: str) -> str:
 
 
 def parse_rows_fast(rows: list[str]) -> list[dict]:
-    """Parse build_rows output into structured transactions using regex.
+    """Parse build_rows output into structured JSON.
 
-    Section-aware: build_rows emits __SECTION__domestic / __SECTION__international
-    markers. Credits detected via '+' prefix on amount.
-    Amount: any digits (with optional commas), optional decimal — truncated to 2dp.
-    Zero LLM calls — runs in milliseconds.
+    Input rows are already structured as "date | description | amount".
+    This function just:
+      1. Normalizes the date (DD/MM/YYYY → YYYY-MM-DD)
+      2. Keeps description as-is
+      3. Cleans amount: remove ₹/Rs/commas, keep the LAST number in the
+         segment (the actual amount — ignoring any leading junk from OCR).
+         If '+' appears before the amount → credit, else debit.
+         Amount is preserved exactly — only rounded to 2dp.
 
     Returns:
-        List of dicts with keys: date, description, amount, type, section.
+        List of dicts: date, description, amount, type.
     """
     transactions = []
     debug_log = []
-    current_section = "domestic"
 
     st.session_state["qwen_input_rows"] = rows
 
     for row_str in rows:
-        # Section markers from build_rows
+        # Skip section markers
         if row_str.startswith("__SECTION__"):
-            current_section = row_str.replace("__SECTION__", "")
-            debug_log.append({"row": row_str, "status": f"SECTION → {current_section}"})
             continue
 
         segments = [s.strip() for s in row_str.split(" | ")]
 
         if len(segments) < 2:
-            debug_log.append({"row": row_str[:60], "status": "SKIP (too few segments)"})
+            debug_log.append({"row": row_str[:80], "status": "SKIP (too few segments)"})
             continue
 
-        # Extract parts
+        # Segments: [date, description, amount] or [date, description]
         date_raw = segments[0]
-        desc_raw = segments[1] if len(segments) >= 2 else ""
-        amount_raw = segments[-1] if len(segments) >= 3 else ""
+        amount_raw = ""
+        desc_raw = ""
 
-        # If only 2 segments, check if second is an amount
-        if len(segments) == 2:
-            if re.match(r"^[+\-]?\d[\d,]*\.?\d*$", segments[1].strip()):
+        if len(segments) >= 3:
+            desc_raw = segments[1]
+            amount_raw = segments[2]
+        elif len(segments) == 2:
+            # Could be date+desc or date+amount
+            if re.search(r"\d", segments[1]) and not re.search(r"[a-zA-Z]{3,}", segments[1]):
                 amount_raw = segments[1]
-                desc_raw = ""
             else:
                 desc_raw = segments[1]
-                amount_raw = ""
 
-        # Normalize date
+        # 1. Date — normalize
         date_normalized = _normalize_date(date_raw)
 
-        # Parse amount — simple: strip +, ₹, Rs, commas → float → round to 2dp
-        is_credit = "+" in amount_raw.split(".")[0]  # '+' anywhere before decimal
-        amount_clean = amount_raw.replace("+", "").replace("-", "")
-        amount_clean = amount_clean.replace("₹", "").replace("Rs.", "").replace("Rs", "")
-        amount_clean = amount_clean.replace(",", "").strip()
+        # 2. Amount — detect credit, then clean and parse
+        #    '+' before the number = credit
+        is_credit = bool(re.match(r"^\+", amount_raw.strip()))
 
-        # Extract the numeric part — digits with optional decimal
-        num_match = re.search(r"(\d+\.?\d*)", amount_clean)
-        if num_match:
-            try:
-                amount_val = round(float(num_match.group(1)), 2)
-            except ValueError:
-                amount_val = 0.0
-        else:
-            amount_val = 0.0
+        #    Strip everything that isn't a digit or decimal point
+        amount_clean = re.sub(r"[^\d.]", "", amount_raw)
 
-        # Skip rows with no usable data
+        #    If multiple dots (OCR noise), keep only the last decimal part
+        #    e.g. "26.455.50" → take the last valid number
+        amount_val = 0.0
+        if amount_clean:
+            # Find ALL numbers with optional decimal in the cleaned string
+            all_nums = re.findall(r"\d+\.\d+|\d+", amount_clean)
+            if all_nums:
+                # Take the LAST one — that's the actual amount
+                # (OCR sometimes puts junk digits before the real amount)
+                try:
+                    amount_val = round(float(all_nums[-1]), 2)
+                except ValueError:
+                    amount_val = 0.0
+
+        # Skip rows with nothing useful
         if not date_normalized and amount_val <= 0:
-            debug_log.append({"row": row_str[:60], "status": "SKIP (no date + no amount)"})
+            debug_log.append({"row": row_str[:80], "status": "SKIP (no date + no amount)"})
             continue
 
         txn_type = "credit" if is_credit else "debit"
@@ -806,9 +813,8 @@ def parse_rows_fast(rows: list[str]) -> list[dict]:
             "description": desc_raw,
             "amount": amount_val,
             "type": txn_type,
-            "section": current_section,
         })
-        debug_log.append({"row": row_str[:60], "status": f"OK [{current_section}]"})
+        debug_log.append({"row": row_str[:80], "status": "OK"})
 
     st.session_state["qwen_debug"] = debug_log
     st.session_state["qwen_raw_output"] = transactions
@@ -889,7 +895,6 @@ def validate_and_store_transactions(
             "description": txn.get("description", ""),
             "amount": float(amt_val) if amount_valid else 0.0,
             "type": txn.get("type", "debit"),
-            "section": txn.get("section", "domestic"),
             "confidence": round(score, 4),
         })
 
@@ -897,7 +902,7 @@ def validate_and_store_transactions(
 
     df = pd.DataFrame(
         validated,
-        columns=["date", "description", "amount", "type", "section", "confidence"],
+        columns=["date", "description", "amount", "type", "confidence"],
     )
 
     st.session_state["df_statements"] = df
