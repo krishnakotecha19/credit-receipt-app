@@ -203,14 +203,34 @@ def extract_receipts_batch(image_paths: list[str], progress_callback=None) -> li
         if proc.returncode != 0:
             err = "".join(stderr_lines)[:500]
             for fb in fallbacks:
-                fb["raw_text"] = f"Subprocess error: {err}"
+                fb["raw_text"] = f"Subprocess error (exit {proc.returncode}): {err}"
             return fallbacks
 
-        results = json.loads(stdout)
+        if not stdout or not stdout.strip():
+            err = "".join(stderr_lines)[:500]
+            for fb in fallbacks:
+                fb["raw_text"] = f"Subprocess returned empty stdout. stderr: {err}"
+            return fallbacks
+
+        try:
+            results = json.loads(stdout)
+        except json.JSONDecodeError as e:
+            for fb in fallbacks:
+                fb["raw_text"] = f"JSON parse error: {e}\nstdout: {stdout[:300]}"
+            return fallbacks
+
         if isinstance(results, list) and len(results) == len(image_paths):
             return results
+        for fb in fallbacks:
+            fb["raw_text"] = f"Unexpected result: got {type(results).__name__} len={len(results) if isinstance(results, list) else '?'}, expected list of {len(image_paths)}"
         return fallbacks
 
+    except subprocess.TimeoutExpired:
+        proc.kill()
+        err = "".join(stderr_lines)[:500]
+        for fb in fallbacks:
+            fb["raw_text"] = f"Subprocess timed out after {timeout}s. stderr: {err}"
+        return fallbacks
     except Exception as e:
         for fb in fallbacks:
             fb["raw_text"] = f"Subprocess error: {e}"
@@ -1244,6 +1264,15 @@ if process_clicked:
             [str(f) for f in receipt_files],
             progress_callback=_receipt_progress,
         )
+
+        # Show quick status in sidebar
+        n_ok = sum(1 for r in receipt_records if r.get("status") == "success")
+        n_fail = len(receipt_records) - n_ok
+        if n_fail:
+            st.sidebar.warning(f"Receipts: {n_ok} success, {n_fail} failed")
+            for r in receipt_records:
+                if r.get("status") != "success":
+                    st.sidebar.caption(f"  {r.get('receipt_file')}: {r.get('raw_text', '')[:200]}")
 
         # Store per-receipt debug info
         receipt_debug = st.session_state.setdefault("debug_receipt_ocr", {})
