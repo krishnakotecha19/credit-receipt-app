@@ -368,71 +368,58 @@ _restore_session_state()
 
 
 def build_rows(ocr_pages: list[dict]) -> tuple[list[str], list[float]]:
-    """Reconstruct table rows from raw OCR word positions using layout analysis.
+    """Reconstruct table rows from raw OCR words.
 
-    Args:
-        ocr_pages: Output from process_statement_pdf().
+    Simple approach:
+      1. Cluster words into rows by Y proximity (adaptive threshold)
+      2. Sort each row's words left-to-right by X
+      3. Join words into a single raw text string
+      4. Skip obvious header/junk rows
+      5. Let parse_rows_fast() handle date/desc/amount extraction via regex
+
+    No zone cutoffs, no amount detection here — just raw row text.
 
     Returns:
-        Tuple of (row_strings, ocr_confidences) where ocr_confidences[i] is the
-        average OCR confidence for words in row_strings[i].
+        Tuple of (row_strings, ocr_confidences).
     """
-    # Header words that ALWAYS indicate a non-transaction row
-    _HEADER_ALWAYS = {"statement", "page", "opening", "closing",
-                       "description", "offers", "explore", "credit card",
-                       "gstin", "hsn"}
-    # Words that are header-like ONLY when the row has NO date pattern
-    _HEADER_IF_NO_DATE = {"total", "balance", "amount"}
-    # Section dividers — skip only when the ENTIRE row is just these words
-    # (e.g. "International Transactions", "Domestic Transactions")
-    _SECTION_DIVIDER_RE = re.compile(
-        r"^(?:international|domestic)\s+transactions?$", re.IGNORECASE
-    )
-    # Date patterns: DD/MM/YYYY, DD-MM-YYYY, YYYY-MM-DD, DD MMM YYYY, DD/MM/YY
+    _HEADER_WORDS = {"statement", "page", "opening", "closing",
+                     "description", "offers", "explore", "credit card",
+                     "gstin", "hsn", "rewards", "unbilled"}
     _DATE_RE = re.compile(
-        r"\d{2}[/\-]\d{2}[/\-]\d{2,4}"       # DD/MM/YYYY or DD-MM-YY
-        r"|"
-        r"\d{4}[/\-]\d{2}[/\-]\d{2}"          # YYYY-MM-DD
-        r"|"
-        r"\d{1,2}\s+(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)[a-z]*\s*\d{2,4}"  # 19 Jan 2026
-        r"|"
-        r"(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)[a-z]*\s+\d{1,2},?\s*\d{2,4}"  # Jan 19, 2026
+        r"\d{2}[/\-]\d{2}[/\-]\d{2,4}"
+        r"|\d{4}[/\-]\d{2}[/\-]\d{2}"
+        r"|\d{1,2}\s+(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)[a-z]*\s*\d{2,4}"
         , re.IGNORECASE
     )
+
     all_rows = []
     all_confs = []
-    _current_section = "domestic"  # track domestic/international across pages
 
     for page_data in ocr_pages:
-        if page_data["status"] != "success":
+        if page_data.get("status") != "success":
             continue
 
-        words = page_data["raw_ocr_words"]
+        words = page_data.get("raw_ocr_words", [])
         if not words:
             continue
 
-        # Compute centers for each word
+        # Compute centers
         for w in words:
             w["center_y"] = (w["y_min"] + w["y_max"]) / 2.0
             w["center_x"] = (w["x_min"] + w["x_max"]) / 2.0
 
-        # Sort by vertical position
+        # Sort by Y
         words.sort(key=lambda w: w["center_y"])
 
-        # Cluster words into rows by Y proximity — adaptive threshold
-        # Compute from actual inter-word Y gaps on this page so tightly
-        # spaced statements (e.g. international sections) don't get merged.
+        # Adaptive row threshold
         y_centers = sorted(set(round(w["center_y"], 4) for w in words))
         if len(y_centers) > 3:
             gaps = sorted(
                 y_centers[i + 1] - y_centers[i]
                 for i in range(len(y_centers) - 1)
-                if y_centers[i + 1] - y_centers[i] > 0.002  # ignore noise
+                if y_centers[i + 1] - y_centers[i] > 0.002
             )
             if gaps:
-                # Use 40th-percentile of real gaps — tight enough to split
-                # rows that are close together but still groups words on the
-                # same line.
                 p40 = gaps[int(len(gaps) * 0.4)]
                 row_threshold = max(0.005, min(p40 * 0.7, 0.015))
             else:
@@ -440,9 +427,9 @@ def build_rows(ocr_pages: list[dict]) -> tuple[list[str], list[float]]:
         else:
             row_threshold = 0.008
 
+        # Cluster into rows
         rows_clustered = []
         current_row = [words[0]]
-
         for w in words[1:]:
             if abs(w["center_y"] - current_row[-1]["center_y"]) < row_threshold:
                 current_row.append(w)
@@ -451,273 +438,41 @@ def build_rows(ocr_pages: list[dict]) -> tuple[list[str], list[float]]:
                 current_row = [w]
         rows_clustered.append(current_row)
 
-        # Compute page-level zone boundaries from ALL words on this page
-        # so cutoffs are stable across rows (not skewed by per-row word count)
-        page_all_cx = sorted(w["center_x"] for w in words)
-        page_p15 = page_all_cx[max(0, int(len(page_all_cx) * 0.15))]
-        page_p85 = page_all_cx[min(len(page_all_cx) - 1, int(len(page_all_cx) * 0.85))]
-        date_cutoff = max(page_p15 + 0.02, 0.15)
-        amount_cutoff = min(page_p85 + 0.02, 0.82)
-
-        # DEBUG: capture row-level word layout for first page
-        if page_data.get("page_number", 1) == 1:
-            _row_layout_debug = st.session_state.setdefault("debug_row_layouts", [])
-            _row_layout_debug.append({
-                "page": page_data.get("page_number", 1),
-                "row_threshold": round(row_threshold, 5),
-                "rows_clustered": len(rows_clustered),
-                "date_cutoff": round(date_cutoff, 4),
-                "amount_cutoff": round(amount_cutoff, 4),
-                "p15": round(page_p15, 4),
-                "p85": round(page_p85, 4),
-                "total_words": len(words),
-            })
-
-        # Regex: token looks like a monetary amount (digits, commas, dots, optional +/- prefix)
-        _AMOUNT_TOKEN_RE = re.compile(
-            r"^[+\-]?\d[\d,]*\.?\d*$"
-        )
-
-        # Track debit/credit column X positions (learned from header rows)
-        _debit_col_x = None
-        _credit_col_x = None
-
-        # DEBUG: capture per-row word layouts (first page only, up to 40 rows)
-        _is_first_page = page_data.get("page_number", 1) == 1
-        _row_word_debug = st.session_state.setdefault("debug_row_words", [])
-
-        # Sort words within each row by X, then zone and reconstruct
-        for row_idx_in_page, row_words in enumerate(rows_clustered):
+        # Process each row
+        for row_words in rows_clustered:
+            # Sort left to right
             row_words.sort(key=lambda w: w["center_x"])
 
-            # Check for header/junk rows — skip them, but first scan
-            # for column layout clues (debit/credit column positions)
-            row_text_lower = " ".join(w["text"].lower() for w in row_words)
-            row_has_date = bool(_DATE_RE.search(row_text_lower))
-            is_always_header = any(hw in row_text_lower for hw in _HEADER_ALWAYS)
-            is_conditional_header = (not row_has_date and
-                                     any(hw in row_text_lower for hw in _HEADER_IF_NO_DATE))
-            is_section_divider = bool(_SECTION_DIVIDER_RE.match(row_text_lower.strip()))
+            # Join all words into raw text
+            raw_text = " ".join(w["text"] for w in row_words)
+            raw_lower = raw_text.lower()
 
-            # Track section changes — emit marker row so parser knows
-            if is_section_divider:
-                if "international" in row_text_lower:
-                    _current_section = "international"
-                else:
-                    _current_section = "domestic"
-                all_rows.append(f"__SECTION__{_current_section}")
-                all_confs.append(1.0)
-                if _is_first_page and len(_row_word_debug) < 40:
-                    _row_word_debug.append({
-                        "row": row_idx_in_page,
-                        "status": f"SECTION → {_current_section}",
-                        "raw_text": row_text_lower[:80],
-                        "words": [],
-                    })
+            # Skip obvious headers
+            if any(hw in raw_lower for hw in _HEADER_WORDS):
                 continue
 
-            if is_always_header or is_conditional_header:
-                # Look for "cr" / "credit" column header to learn the credit X zone
-                for w in row_words:
-                    wt = w["text"].lower().strip()
-                    if wt in ("cr", "credit", "cr."):
-                        _credit_col_x = w["center_x"]
-                    elif wt in ("dr", "debit", "dr."):
-                        _debit_col_x = w["center_x"]
-                if _is_first_page and len(_row_word_debug) < 40:
-                    _row_word_debug.append({
-                        "row": row_idx_in_page,
-                        "status": "SKIPPED (header)",
-                        "raw_text": row_text_lower[:80],
-                        "words": [{"text": w["text"], "cx": round(w["center_x"], 4)}
-                                  for w in row_words],
-                    })
-                continue
-
-            # Skip rows with too few words (likely junk)
+            # Skip rows with fewer than 2 words
             if len(row_words) < 2:
                 continue
 
-            # --- Zone assignment: date (left), description (middle), amount (rightmost number) ---
-            # Strategy: scan all words, find the RIGHTMOST token that looks
-            # like a monetary amount (digits with comma/dot).  Everything
-            # left of date_cutoff is date, everything between date and that
-            # rightmost amount is description.  This avoids the broken
-            # amount_cutoff which varies per-PDF layout.
-
-            # Step 1: identify the rightmost amount-like token in the row
-            _amount_idx = -1   # index in row_words of the chosen amount token
-            for wi in range(len(row_words) - 1, -1, -1):
-                w = row_words[wi]
-                text = w["text"]
-                cleaned = text.replace("O", "0").replace("o", "0").replace("l", "1")
-                if cleaned.startswith("R") and len(cleaned) > 1 and cleaned[1:2].isdigit():
-                    cleaned = cleaned[1:]
-                if _AMOUNT_TOKEN_RE.match(cleaned) and ("," in cleaned or "." in cleaned):
-                    _amount_idx = wi
-                    break
-
-            # If no amount with decimal/comma found, try any numeric token from right
-            if _amount_idx == -1:
-                for wi in range(len(row_words) - 1, -1, -1):
-                    w = row_words[wi]
-                    cleaned = w["text"].replace("O", "0").replace("o", "0").replace("l", "1")
-                    if _AMOUNT_TOKEN_RE.match(cleaned):
-                        _amount_idx = wi
-                        break
-
-            # Step 2: detect credit — look for '+' ANYWHERE near the right
-            # side of the row (within 3 words of the amount, or any word
-            # to the right of the description zone).
-            row_is_credit = False
-            if _amount_idx >= 0:
-                # Check geometric welding first (pixel-level '+' detection)
-                if row_words[_amount_idx].get("has_plus_prefix"):
-                    row_is_credit = True
-
-                # Check nearby words (up to 3 positions before the amount)
-                # for a standalone '+' sign
-                if not row_is_credit:
-                    search_start = max(0, _amount_idx - 3)
-                    for si in range(search_start, _amount_idx):
-                        if row_words[si]["text"].strip() == "+":
-                            row_is_credit = True
-                            break
-
-                # Check if any word AFTER the amount is '+'
-                if not row_is_credit:
-                    for si in range(_amount_idx + 1, len(row_words)):
-                        if row_words[si]["text"].strip() == "+":
-                            row_is_credit = True
-                            break
-
-                # Check if the amount token itself starts with '+'
-                amt_text = row_words[_amount_idx]["text"]
-                if amt_text.strip().startswith("+"):
-                    row_is_credit = True
-
-            # Step 3: build date, description, amount from the split
-            # Words that are standalone '+'/'-' near the amount are consumed
-            # (not added to description)
-            _plus_minus_indices = set()
-            if _amount_idx >= 0:
-                search_start = max(0, _amount_idx - 3)
-                for si in range(search_start, min(len(row_words), _amount_idx + 3)):
-                    if si != _amount_idx and row_words[si]["text"].strip() in ("+", "-"):
-                        _plus_minus_indices.add(si)
-
-            date_parts = []
-            desc_parts = []
-            amount_str = ""
-
-            for wi, w in enumerate(row_words):
-                cx = w["center_x"]
-                text = w["text"]
-
-                if wi == _amount_idx:
-                    cleaned = text.replace("O", "0").replace("o", "0").replace("l", "1")
-                    if cleaned.startswith("R") and len(cleaned) > 1 and cleaned[1:2].isdigit():
-                        cleaned = cleaned[1:]
-                    # Strip leading '+' from the amount value itself
-                    amount_str = cleaned.lstrip("+")
-                elif wi in _plus_minus_indices:
-                    # consumed by credit detection — don't add to description
-                    pass
-                elif cx < date_cutoff:
-                    date_parts.append(text)
-                else:
-                    desc_parts.append(text)
-
-            # Prepend '+' to amount string if credit
-            if row_is_credit and amount_str and not amount_str.startswith("+"):
-                amount_str = "+" + amount_str
-
-            date_str = " ".join(date_parts).strip()
-            desc_str = " ".join(desc_parts).strip()
-
-            # DEBUG: save row layout
-            if _is_first_page and len(_row_word_debug) < 40:
-                _row_word_debug.append({
-                    "row": row_idx_in_page,
-                    "status": "KEPT" if re.search(r"\d{2}[/\-]\d{2}", date_str) else "SKIPPED (no date)",
-                    "date_parts": date_str,
-                    "desc_parts": desc_str[:50],
-                    "amount_final": amount_str,
-                    "is_credit": row_is_credit,
-                    "amount_idx": _amount_idx,
-                })
-
-            # Clean up date: remove trailing junk digit from OCR (e.g. "19/01/20261" -> "19/01/2026")
-            date_match = _DATE_RE.search(date_str)
-            if date_match:
-                date_str = date_match.group(0)
-
-            # Only keep rows that look like actual transactions (must have a date pattern)
-            if not date_match:
+            # Must contain a date pattern to be a transaction row
+            if not _DATE_RE.search(raw_text):
                 continue
 
-            # Build the row string
-            parts = []
-            if date_str:
-                parts.append(date_str)
-            if desc_str:
-                parts.append(desc_str)
-            if amount_str:
-                parts.append(amount_str)
+            # Check for geometric welding '+' on any word (credit marker)
+            has_plus = any(w.get("has_plus_prefix") for w in row_words)
+            # Also check for standalone '+' token anywhere in the row
+            if not has_plus:
+                has_plus = any(w["text"].strip() == "+" for w in row_words)
 
-            reconstructed = " | ".join(parts)
-            if reconstructed.strip():
-                all_rows.append(reconstructed)
-                # Average OCR confidence for this row's words
-                avg_conf = sum(w["confidence"] for w in row_words) / len(row_words)
-                all_confs.append(avg_conf)
+            if has_plus:
+                raw_text = "+" + raw_text
 
-    # Merge rows with no amount into the next row's description
-    # (multi-line descriptions where OCR split the text across rows)
-    # Never merge __SECTION__ markers.
-    merged_rows = []
-    merged_confs = []
-    i = 0
-    while i < len(all_rows):
-        row = all_rows[i]
-        conf = all_confs[i]
+            all_rows.append(raw_text)
+            avg_conf = sum(w["confidence"] for w in row_words) / len(row_words)
+            all_confs.append(avg_conf)
 
-        # Section markers pass through untouched
-        if row.startswith("__SECTION__"):
-            merged_rows.append(row)
-            merged_confs.append(conf)
-            i += 1
-            continue
-
-        segments = row.split(" | ")
-        last_seg = segments[-1] if segments else ""
-        has_amount = bool(re.search(r"\d+\.?\d*", last_seg)) and len(segments) >= 3
-        if not has_amount and i + 1 < len(all_rows):
-            # Skip over any section markers when looking for next row
-            next_i = i + 1
-            while next_i < len(all_rows) and all_rows[next_i].startswith("__SECTION__"):
-                merged_rows.append(all_rows[next_i])
-                merged_confs.append(all_confs[next_i])
-                next_i += 1
-            if next_i < len(all_rows):
-                next_segments = all_rows[next_i].split(" | ")
-                if len(next_segments) >= 2:
-                    next_segments[1] = row.replace(" | ", " ") + " " + next_segments[1]
-                    all_rows[next_i] = " | ".join(next_segments)
-                    all_confs[next_i] = (conf + all_confs[next_i]) / 2.0
-                else:
-                    merged_rows.append(row)
-                    merged_confs.append(conf)
-            else:
-                merged_rows.append(row)
-                merged_confs.append(conf)
-            i = next_i
-        else:
-            merged_rows.append(row)
-            merged_confs.append(conf)
-            i += 1
-
-    return merged_rows, merged_confs
+    return all_rows, all_confs
 
 
 def _normalize_date(date_str: str) -> str:
@@ -760,85 +515,90 @@ def _normalize_date(date_str: str) -> str:
 
 
 def parse_rows_fast(rows: list[str]) -> list[dict]:
-    """Parse build_rows output into structured JSON.
+    """Parse raw OCR row text into structured JSON using regex.
 
-    Input rows are already structured as "date | description | amount".
-    This function just:
-      1. Normalizes the date (DD/MM/YYYY → YYYY-MM-DD)
-      2. Keeps description as-is
-      3. Cleans amount: remove ₹/Rs/commas, keep the LAST number in the
-         segment (the actual amount — ignoring any leading junk from OCR).
-         If '+' appears before the amount → credit, else debit.
-         Amount is preserved exactly — only rounded to 2dp.
+    Input: raw row text like "25/02/2026 15:40 ING*MAKE MY TRIP 7,627.00"
+    Output: {date, description, amount, type}
+
+    Logic:
+      1. Detect credit: row starts with '+' → credit, strip the '+'
+      2. Find FIRST date pattern → date
+      3. Find LAST amount pattern (number with decimal, rightmost) → amount
+      4. Everything between date and amount → description
+      5. Amount is preserved exactly as OCR produced, just cleaned of commas
 
     Returns:
         List of dicts: date, description, amount, type.
     """
+    _DATE_RE = re.compile(
+        r"\d{2}[/\-]\d{2}[/\-]\d{2,4}"
+        r"|\d{4}[/\-]\d{2}[/\-]\d{2}"
+        r"|\d{1,2}\s+(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)[a-z]*\s*\d{2,4}"
+        , re.IGNORECASE
+    )
+    # Amount pattern: optional sign, digits with commas, decimal with 1-2 digits
+    # Must have a decimal point to distinguish from IDs/phone numbers
+    _AMOUNT_RE = re.compile(r"[+\-]?\d[\d,]*\.\d{1,2}")
+
     transactions = []
     debug_log = []
 
     st.session_state["qwen_input_rows"] = rows
 
     for row_str in rows:
-        # Skip section markers
-        if row_str.startswith("__SECTION__"):
+        # 1. Credit detection: '+' at start means credit (build_rows prepends it)
+        is_credit = row_str.startswith("+")
+        text = row_str.lstrip("+").strip()
+
+        # 2. Find the FIRST date in the row
+        date_match = _DATE_RE.search(text)
+        if not date_match:
+            debug_log.append({"row": row_str[:80], "status": "SKIP (no date)"})
             continue
 
-        segments = [s.strip() for s in row_str.split(" | ")]
-
-        if len(segments) < 2:
-            debug_log.append({"row": row_str[:80], "status": "SKIP (too few segments)"})
-            continue
-
-        # Segments: [date, description, amount] or [date, description]
-        date_raw = segments[0]
-        amount_raw = ""
-        desc_raw = ""
-
-        if len(segments) >= 3:
-            desc_raw = segments[1]
-            amount_raw = segments[2]
-        elif len(segments) == 2:
-            # Could be date+desc or date+amount
-            if re.search(r"\d", segments[1]) and not re.search(r"[a-zA-Z]{3,}", segments[1]):
-                amount_raw = segments[1]
-            else:
-                desc_raw = segments[1]
-
-        # 1. Date — normalize
+        date_raw = date_match.group(0)
         date_normalized = _normalize_date(date_raw)
+        date_end = date_match.end()
 
-        # 2. Amount — detect credit, then clean and parse
-        #    '+' before the number = credit
-        is_credit = bool(re.match(r"^\+", amount_raw.strip()))
-
-        #    Strip everything that isn't a digit or decimal point
-        amount_clean = re.sub(r"[^\d.]", "", amount_raw)
-
-        #    If multiple dots (OCR noise), keep only the last decimal part
-        #    e.g. "26.455.50" → take the last valid number
-        amount_val = 0.0
-        if amount_clean:
-            # Find ALL numbers with optional decimal in the cleaned string
-            all_nums = re.findall(r"\d+\.\d+|\d+", amount_clean)
-            if all_nums:
-                # Take the LAST one — that's the actual amount
-                # (OCR sometimes puts junk digits before the real amount)
-                try:
-                    amount_val = round(float(all_nums[-1]), 2)
-                except ValueError:
-                    amount_val = 0.0
-
-        # Skip rows with nothing useful
-        if not date_normalized and amount_val <= 0:
-            debug_log.append({"row": row_str[:80], "status": "SKIP (no date + no amount)"})
+        # 3. Find ALL amounts in the row, take the LAST one (rightmost = actual amount)
+        amounts = list(_AMOUNT_RE.finditer(text))
+        if not amounts:
+            debug_log.append({"row": row_str[:80], "status": "SKIP (no amount)"})
             continue
+
+        last_amount_match = amounts[-1]
+        amount_raw = last_amount_match.group(0)
+        amount_start = last_amount_match.start()
+
+        # Check if this amount is credit: '+' in the matched amount itself,
+        # or '+' in the 2 chars before it
+        if not is_credit:
+            if amount_raw.startswith("+"):
+                is_credit = True
+            elif amount_start > 0:
+                before = text[max(0, amount_start - 2):amount_start].strip()
+                if "+" in before:
+                    is_credit = True
+
+        # Clean amount: strip +/-, remove commas, parse as float
+        amount_clean = amount_raw.lstrip("+-").replace(",", "")
+        try:
+            amount_val = round(float(amount_clean), 2)
+        except ValueError:
+            debug_log.append({"row": row_str[:80], "status": "SKIP (bad amount)"})
+            continue
+
+        # 4. Description = everything between date end and amount start
+        desc = text[date_end:amount_start].strip()
+        # Clean up: remove leading/trailing time patterns, junk
+        desc = re.sub(r"^\d{1,2}:\d{2}\s*", "", desc)  # strip leading time HH:MM
+        desc = desc.strip(" |-")
 
         txn_type = "credit" if is_credit else "debit"
 
         transactions.append({
             "date": date_normalized,
-            "description": desc_raw,
+            "description": desc,
             "amount": amount_val,
             "type": txn_type,
         })
