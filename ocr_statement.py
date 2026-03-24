@@ -88,27 +88,28 @@ def process_statement_pdf(pdf_path: str, poppler_path: str = None) -> list[dict]
 
     pages_out = []
     try:
-        kwargs = {"dpi": 200}
+        kwargs = {"dpi": 150}
         if poppler_path:
             kwargs["poppler_path"] = poppler_path
         pil_images = convert_from_path(pdf_path, **kwargs)
     except Exception as e:
         return [{"page_number": 1, "raw_ocr_words": [], "status": f"failed: {e}"}]
 
-    # Keep RGB copies for geometric welding (plus-sign detection)
-    rgb_images = [np.array(img) for img in pil_images]
-    del pil_images
-    gc.collect()
+    model = _get_doctr()
 
-    try:
-        model = _get_doctr()
-        result = model(rgb_images)
-    except Exception as e:
-        return [{"page_number": i + 1, "raw_ocr_words": [], "status": f"failed: {e}"}
-                for i in range(len(rgb_images))]
+    # Process ONE page at a time — lower peak memory, prevents OOM
+    for page_idx, pil_img in enumerate(pil_images):
+        page_img = np.array(pil_img)
+        del pil_img
 
-    for page_idx, page in enumerate(result.pages):
-        page_img = rgb_images[page_idx] if page_idx < len(rgb_images) else None
+        try:
+            result = model([page_img])
+        except Exception as e:
+            pages_out.append({"page_number": page_idx + 1, "raw_ocr_words": [],
+                              "status": f"failed: {e}"})
+            continue
+
+        page = result.pages[0]
         words = []
         for block in page.blocks:
             for line in block.lines:
@@ -142,8 +143,9 @@ def process_statement_pdf(pdf_path: str, poppler_path: str = None) -> list[dict]
             "status": "success" if words else "failed: no words detected",
         })
 
-    del result, rgb_images
-    gc.collect()
+        del page_img, result
+        gc.collect()
+
     return pages_out
 
 

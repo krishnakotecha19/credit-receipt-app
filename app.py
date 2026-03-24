@@ -2758,3 +2758,56 @@ with tab_ocr_debug:
             st.divider()
     else:
         st.info("Run processing to see receipt debug output.")
+
+    # ── Statement Debug ──
+    st.markdown("---")
+    st.subheader("Statement Debug")
+
+    # Page-level layout info
+    _layout_debug = st.session_state.get("debug_row_layouts", [])
+    if _layout_debug:
+        st.markdown("**Page Layout**")
+        st.dataframe(pd.DataFrame(_layout_debug), hide_index=True)
+
+    # Row-level word debug (first page)
+    _word_debug = st.session_state.get("debug_row_words", [])
+    if _word_debug:
+        with st.expander(f"Row-level word zones ({len(_word_debug)} rows)", expanded=False):
+            for rd in _word_debug:
+                status = rd.get("status", "")
+                color = "green" if "KEPT" in status else "red" if "SKIP" in status else "gray"
+                st.markdown(f":{color}[Row {rd.get('row', '?')}]: {status}")
+                if rd.get("words"):
+                    st.caption(" | ".join(
+                        f"{w.get('text', '')}({w.get('zone', '?')})"
+                        for w in rd["words"][:15]
+                    ))
+
+    # Reconstructed rows (input to parser)
+    _input_rows = st.session_state.get("qwen_input_rows", [])
+    if _input_rows:
+        st.markdown(f"**Reconstructed Rows ({len(_input_rows)})**")
+        for i, r in enumerate(_input_rows):
+            st.text(f"{i+1:3d}. {r}")
+
+    # Parsed transactions (output)
+    _parsed_txns = st.session_state.get("qwen_raw_output", [])
+    if _parsed_txns:
+        st.markdown(f"**Parsed Transactions ({len(_parsed_txns)})**")
+        st.dataframe(pd.DataFrame(_parsed_txns), hide_index=True, use_container_width=True)
+
+    # Credit debug
+    _credit_debug = st.session_state.get("debug_credit_rows", [])
+    if _credit_debug:
+        st.markdown(f"**Credit Rows Detected ({len(_credit_debug)})**")
+        for idx, row_str in _credit_debug:
+            st.text(f"  Row {idx}: {row_str}")
+
+    # Validation debug
+    _val_debug = st.session_state.get("validation_debug", [])
+    if _val_debug:
+        with st.expander(f"Validation Details ({len(_val_debug)} rows)", expanded=False):
+            st.dataframe(pd.DataFrame(_val_debug), hide_index=True, use_container_width=True)
+
+    if not _input_rows and not _layout_debug:
+        st.info("Upload a statement and click Process to see debug output.")
