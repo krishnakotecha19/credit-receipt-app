@@ -538,102 +538,91 @@ def build_rows(ocr_pages: list[dict]) -> tuple[list[str], list[float]]:
             if len(row_words) < 2:
                 continue
 
+            # --- Zone assignment: date (left), description (middle), amount (rightmost number) ---
+            # Strategy: scan all words, find the RIGHTMOST token that looks
+            # like a monetary amount (digits with comma/dot).  Everything
+            # left of date_cutoff is date, everything between date and that
+            # rightmost amount is description.  This avoids the broken
+            # amount_cutoff which varies per-PDF layout.
+
+            # Step 1: identify the rightmost amount-like token in the row
+            _amount_idx = -1   # index in row_words of the chosen amount token
+            _sign_idx = -1     # index of a standalone '+'/'-' just before it
+            for wi in range(len(row_words) - 1, -1, -1):
+                w = row_words[wi]
+                text = w["text"]
+                # Fix OCR noise before checking
+                cleaned = text.replace("O", "0").replace("o", "0").replace("l", "1")
+                if cleaned.startswith("R") and len(cleaned) > 1 and cleaned[1:2].isdigit():
+                    cleaned = cleaned[1:]
+                if _AMOUNT_TOKEN_RE.match(cleaned) and ("," in cleaned or "." in cleaned):
+                    _amount_idx = wi
+                    # Check if the word just before is a standalone sign
+                    if wi > 0 and row_words[wi - 1]["text"].strip() in ("+", "-"):
+                        _sign_idx = wi - 1
+                    break
+
+            # If no amount with decimal/comma found, try any numeric token from right
+            if _amount_idx == -1:
+                for wi in range(len(row_words) - 1, -1, -1):
+                    w = row_words[wi]
+                    cleaned = w["text"].replace("O", "0").replace("o", "0").replace("l", "1")
+                    if _AMOUNT_TOKEN_RE.match(cleaned):
+                        _amount_idx = wi
+                        if wi > 0 and row_words[wi - 1]["text"].strip() in ("+", "-"):
+                            _sign_idx = wi - 1
+                        break
+
+            # Step 2: build date, description, amount from the split
             date_parts = []
             desc_parts = []
-            amount_parts = []          # list of (cleaned_text, center_x)
-            _pending_sign = ""         # holds a standalone '+' or '-' from amount zone
-            _word_zones = []           # DEBUG: track zone assignment per word
+            amount_str = ""
+            row_is_credit = False
 
-            for w in row_words:
+            for wi, w in enumerate(row_words):
                 cx = w["center_x"]
                 text = w["text"]
-                if cx < date_cutoff:
-                    date_parts.append(text)
-                    _word_zones.append({"text": text, "cx": round(cx, 4), "zone": "DATE"})
-                elif cx > amount_cutoff:
-                    # Fix OCR noise in numeric zone: O->0, l->1
-                    cleaned = text.replace("O", "0").replace("o", "0")
-                    cleaned = cleaned.replace("l", "1")
-                    # Strip leading 'R' (OCR misread of rupee symbol)
+
+                if wi == _amount_idx:
+                    cleaned = text.replace("O", "0").replace("o", "0").replace("l", "1")
                     if cleaned.startswith("R") and len(cleaned) > 1 and cleaned[1:2].isdigit():
                         cleaned = cleaned[1:]
-
-                    # Handle standalone '+' or '-' sign (OCR splits sign from number)
-                    if cleaned in ("+", "-"):
-                        _pending_sign = cleaned
-                        _word_zones.append({"text": text, "cx": round(cx, 4), "zone": "AMOUNT(sign)"})
-                        continue
-
-                    # Prepend any pending sign to this token
-                    if _pending_sign:
-                        cleaned = _pending_sign + cleaned
-                        _pending_sign = ""
-
-                    # Only keep tokens that actually look like numbers —
-                    # reject stray letters / serial numbers that bled into
-                    # the amount zone.
-                    if _AMOUNT_TOKEN_RE.match(cleaned):
-                        amount_parts.append((cleaned, cx))
-                        _word_zones.append({"text": text, "cx": round(cx, 4),
-                                            "zone": "AMOUNT", "cleaned": cleaned})
-                    else:
-                        # Not numeric — push back to description
-                        desc_parts.append(text)
-                        _word_zones.append({"text": text, "cx": round(cx, 4),
-                                            "zone": "AMOUNT→DESC(rejected)"})
+                    amount_str = cleaned
+                elif wi == _sign_idx:
+                    # standalone sign for the amount
+                    if text.strip() == "+":
+                        row_is_credit = True
+                elif cx < date_cutoff:
+                    date_parts.append(text)
                 else:
-                    # If a pending sign was never consumed, it was noise — discard it
-                    _pending_sign = ""
                     desc_parts.append(text)
-                    _word_zones.append({"text": text, "cx": round(cx, 4), "zone": "DESC"})
+
+            # Credit detection via Geometric Welding (pixel probe for '+' sign)
+            if not row_is_credit and _amount_idx >= 0:
+                w = row_words[_amount_idx]
+                if w.get("has_plus_prefix"):
+                    row_is_credit = True
+            # Also check if amount_str itself starts with '+'
+            if amount_str.startswith("+"):
+                row_is_credit = True
+                amount_str = amount_str[1:]
+
+            if row_is_credit and amount_str and not amount_str.startswith("+"):
+                amount_str = "+" + amount_str
 
             date_str = " ".join(date_parts).strip()
             desc_str = " ".join(desc_parts).strip()
 
-            # --- Determine the transaction amount and whether it's credit ---
-            # Filter to only proper amount tokens (contain comma or dot)
-            proper_amounts = [(t, x) for t, x in amount_parts if "," in t or "." in t]
-            if not proper_amounts:
-                # Fall back to all amount tokens
-                proper_amounts = amount_parts
-
-            row_is_credit = False
-
-            if len(proper_amounts) >= 2:
-                # Multiple amount tokens — pick the last proper one
-                amount_str = proper_amounts[-1][0]
-            elif len(proper_amounts) == 1:
-                amount_str = proper_amounts[0][0]
-            else:
-                amount_str = ""
-
-            # --- Credit detection via Geometric Welding ---
-            # ocr_statement.py probes a pixel strip left of each amount
-            # token for a '+' sign mark that DocTR can't recognise as text.
-            # If any amount-zone word has has_plus_prefix=True → credit.
-            for w in row_words:
-                if w.get("has_plus_prefix") and w["center_x"] > amount_cutoff:
-                    row_is_credit = True
-                    break
-
-            # If credit detected, prepend '+' so downstream (Qwen + validation) can see it
-            if row_is_credit and amount_str and not amount_str.startswith("+"):
-                amount_str = "+" + amount_str
-
-            # DEBUG: save row layout for first page
+            # DEBUG: save row layout
             if _is_first_page and len(_row_word_debug) < 40:
                 _row_word_debug.append({
                     "row": row_idx_in_page,
                     "status": "KEPT" if re.search(r"\d{2}[/\-]\d{2}", date_str) else "SKIPPED (no date)",
                     "date_parts": date_str,
                     "desc_parts": desc_str[:50],
-                    "amount_parts_raw": " | ".join(t for t, _ in amount_parts),
                     "amount_final": amount_str,
                     "is_credit": row_is_credit,
-                    "n_amount_tokens": len(amount_parts),
-                    "debit_col_x": round(_debit_col_x, 4) if _debit_col_x else None,
-                    "credit_col_x": round(_credit_col_x, 4) if _credit_col_x else None,
-                    "words": _word_zones,
+                    "amount_idx": _amount_idx,
                 })
 
             # Clean up date: remove trailing junk digit from OCR (e.g. "19/01/20261" -> "19/01/2026")
@@ -662,28 +651,45 @@ def build_rows(ocr_pages: list[dict]) -> tuple[list[str], list[float]]:
                 all_confs.append(avg_conf)
 
     # Merge rows with no amount into the next row's description
+    # (multi-line descriptions where OCR split the text across rows)
+    # Never merge __SECTION__ markers.
     merged_rows = []
     merged_confs = []
     i = 0
     while i < len(all_rows):
         row = all_rows[i]
         conf = all_confs[i]
-        # If row has no pipe-separated amount section (no digits after last pipe)
+
+        # Section markers pass through untouched
+        if row.startswith("__SECTION__"):
+            merged_rows.append(row)
+            merged_confs.append(conf)
+            i += 1
+            continue
+
         segments = row.split(" | ")
         last_seg = segments[-1] if segments else ""
-        has_amount = bool(re.search(r"\d+\.?\d*", last_seg)) and len(segments) >= 2
+        has_amount = bool(re.search(r"\d+\.?\d*", last_seg)) and len(segments) >= 3
         if not has_amount and i + 1 < len(all_rows):
-            # Merge with next row's description
-            next_segments = all_rows[i + 1].split(" | ")
-            if len(next_segments) >= 2:
-                next_segments[1] = row.replace(" | ", " ") + " " + next_segments[1]
-                all_rows[i + 1] = " | ".join(next_segments)
-                # Average the confidences of merged rows
-                all_confs[i + 1] = (conf + all_confs[i + 1]) / 2.0
+            # Skip over any section markers when looking for next row
+            next_i = i + 1
+            while next_i < len(all_rows) and all_rows[next_i].startswith("__SECTION__"):
+                merged_rows.append(all_rows[next_i])
+                merged_confs.append(all_confs[next_i])
+                next_i += 1
+            if next_i < len(all_rows):
+                next_segments = all_rows[next_i].split(" | ")
+                if len(next_segments) >= 2:
+                    next_segments[1] = row.replace(" | ", " ") + " " + next_segments[1]
+                    all_rows[next_i] = " | ".join(next_segments)
+                    all_confs[next_i] = (conf + all_confs[next_i]) / 2.0
+                else:
+                    merged_rows.append(row)
+                    merged_confs.append(conf)
             else:
                 merged_rows.append(row)
                 merged_confs.append(conf)
-            i += 1
+            i = next_i
         else:
             merged_rows.append(row)
             merged_confs.append(conf)
