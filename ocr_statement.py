@@ -25,11 +25,12 @@ os.environ["OMP_NUM_THREADS"] = "1"
 # Leading +/- is optional so DocTR-merged tokens like "+7,627.00" are recognised.
 _AMT_RE = re.compile(r"^[+\-]?\d[\d,]*\.\d{2}$")
 
-# Cleans up amounts where DocTR merges trailing characters:
-#   "7,627.002" or "7,627.001" → "7,627.00"  (trailing row-index digit)
-#   "7,627.0023" → "7,627.00"  (trailing multi-digit row-index e.g. "23")
-#   "3,598.26R" → "3,598.26"  (trailing credit marker 'R')
-_TRAIL_CLEANUP = re.compile(r'^([+\-]?\d[\d,]*\.\d{2})(\d{1,3}|[Rr])$')
+# Cleans up amounts where DocTR merges trailing row-index digit(s):
+#   "7,627.002" → "7,627.00"   (trailing '2')
+#   "7,627.0023" → "7,627.00"  (trailing '23')
+# NOTE: trailing 'R' is NOT stripped here — it was unreliable as a credit
+# marker across different PDF formats.
+_TRAIL_CLEANUP = re.compile(r'^([+\-]?\d[\d,]*\.\d{2})(\d{1,3})$')
 
 # Cleans up dates where DocTR merges the trailing row-index digit or table border:
 #   "25/02/20261" → "25/02/2026", "25/02/2026]" → "25/02/2026"
@@ -188,11 +189,7 @@ def process_statement_pdf(pdf_path: str, poppler_path: str = None) -> list[dict]
                     # sees a clean "D,DDD.DD" amount token.
                     _tc = _TRAIL_CLEANUP.match(raw_text)
                     if _tc:
-                        raw_text = _tc.group(1)          # strip trailing char
-                        if _tc.group(2).upper() == 'R':
-                            # "R" = credit indicator on this statement; we will
-                            # propagate this as has_plus_prefix below.
-                            pass  # handled after plus_prefix logic below
+                        raw_text = _tc.group(1)   # strip trailing row-index digit(s)
 
                     # --- Strip OCR artifacts for ₹ symbol prepended to amounts ---
                     # DocTR frequently reads the '₹' symbol as 'R', '?', or literally '₹'.
@@ -204,12 +201,10 @@ def process_statement_pdf(pdf_path: str, poppler_path: str = None) -> list[dict]
                         raw_text = _PREFIX_CLEANUP.sub('', raw_text)
 
                     # --- Credit detection ---
-                    # Strategy 1: DocTR includes '+' directly in the token value
-                    # (e.g. "+7,627.00").  Strip it and mark as credit.
+                    # ONLY reliable signal: explicit '+' prefix in the token text.
+                    # All other heuristics (geometric welding, trailing 'R') were
+                    # unreliable across different PDF statement formats.
                     plus_prefix = False
-                    # Also mark credit if the original token had trailing "R"
-                    if _tc and _tc.group(2).upper() == 'R':
-                        plus_prefix = True
                     if raw_text.startswith("+") and _AMT_RE.match(raw_text):
                         plus_prefix = True
                         raw_text = raw_text[1:]  # strip leading '+' for clean numeric text
