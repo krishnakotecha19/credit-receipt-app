@@ -1413,12 +1413,19 @@ def parse_rows_columnar(rows: list[str]) -> list[dict]:
         desc = _TRAILING_R_RE.sub('', desc)
         desc = desc.strip(' |-')
 
-        # ── Parse amount value ──
+        # ── Parse amount value (always float with 2 decimal places) ──
         if amt_match:
             amt_match_str = amt_match.group(0)
             corrected_amt_str = _strip_bogus_rupee_2(amt_match_str, desc)
             try:
-                amount_val = round(float(corrected_amt_str.lstrip('+-').replace(',', '')), 2)
+                # If DocTR completely missed the decimal point (e.g., extracted "7367"),
+                # assume the last two digits are cents ("73.67").
+                clean_str = corrected_amt_str.lstrip('+-').replace(',', '')
+                if '.' not in clean_str:
+                    # No decimal point found: treat last 2 digits as cents
+                    amount_val = round(float(clean_str) / 100.0, 2)
+                else:
+                    amount_val = round(float(clean_str), 2)
             except ValueError:
                 amount_val = 0.0
                 status_notes.append("amount parse error")
