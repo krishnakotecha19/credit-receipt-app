@@ -1616,7 +1616,7 @@ def validate_and_store_transactions(
         validated.append({
             "date": date_val,
             "description": txn.get("description", ""),
-            "amount": float(amt_val) if amount_valid else 0.0,
+            "amount": round(float(amt_val), 2) if amount_valid else 0.0,
             "type": txn.get("type", "debit"),
             "confidence": round(score, 4),
         })

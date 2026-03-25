@@ -28,9 +28,12 @@ _AMT_RE = re.compile(r"^[+\-]?\d[\d,]*\.\d{2}$")
 # Cleans up amounts where DocTR merges trailing row-index digit(s):
 #   "7,627.002" → "7,627.00"   (trailing '2')
 #   "7,627.0023" → "7,627.00"  (trailing '23')
-# NOTE: trailing 'R' is NOT stripped here — it was unreliable as a credit
-# marker across different PDF formats.
 _TRAIL_CLEANUP = re.compile(r'^([+\-]?\d[\d,]*\.\d{2})(\d{1,3})$')
+
+# Detects trailing 'R' credit marker on amounts:
+#   "3,598.26R" → amount "3,598.26", is_credit=True
+# The 'R' (Reversal/Refund) suffix is used on credit card statements for credits.
+_TRAIL_R_CREDIT = re.compile(r'^([+\-]?\d[\d,]*\.\d{2})[Rr]$')
 
 # Cleans up dates where DocTR merges the trailing row-index digit or table border:
 #   "25/02/20261" → "25/02/2026", "25/02/2026]" → "25/02/2026"
@@ -201,10 +204,20 @@ def process_statement_pdf(pdf_path: str, poppler_path: str = None) -> list[dict]
                         raw_text = _PREFIX_CLEANUP.sub('', raw_text)
 
                     # --- Credit detection ---
-                    # ONLY reliable signal: explicit '+' prefix in the token text.
-                    # All other heuristics (geometric welding, trailing 'R') were
-                    # unreliable across different PDF statement formats.
+                    # Two reliable signals:
+                    #   1. Explicit '+' prefix in the token text (+7,627.00)
+                    #   2. Trailing 'R' suffix (3,598.26R) — credit card refund marker
+                    # Geometric welding (pixel probing) is DISABLED — it caused
+                    # false positives on different PDF layouts.
                     plus_prefix = False
+
+                    # Check trailing 'R' credit marker (e.g. "3,598.26R")
+                    _rc = _TRAIL_R_CREDIT.match(raw_text)
+                    if _rc:
+                        raw_text = _rc.group(1)   # strip trailing R
+                        plus_prefix = True
+
+                    # Check explicit '+' prefix (e.g. "+7,627.00")
                     if raw_text.startswith("+") and _AMT_RE.match(raw_text):
                         plus_prefix = True
                         raw_text = raw_text[1:]  # strip leading '+' for clean numeric text
