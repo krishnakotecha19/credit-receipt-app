@@ -1540,6 +1540,8 @@ with st.sidebar:
     # Process buttons — stacked vertically: Process, Process Online, Clear Cache
     process_clicked = st.button("Process", type="primary", use_container_width=True)
     process_online_clicked = st.button("Process Online", type="secondary", use_container_width=True)
+    parse_stmt_clicked = st.button("🔍 Parse Statement (Debug)", use_container_width=True,
+                                   help="Run DocTR OCR only — shows raw words to diagnose extraction")
     if st.button("Clear Cache", use_container_width=True):
         # Wipe all cached state so next Process runs fresh
         for k in _PERSIST_DF_KEYS + _PERSIST_SCALAR_KEYS:
@@ -1547,7 +1549,8 @@ with st.sidebar:
         for k in ["qwen_input_rows", "qwen_debug", "qwen_raw_output",
                    "debug_qwen_credits", "validation_debug",
                    "statement_pages", "debug_row_layouts",
-                   "debug_row_words", "debug_credit_rows"]:
+                   "debug_row_words", "debug_credit_rows",
+                   "raw_ocr_pages"]:
             st.session_state.pop(k, None)
         _SESSION_CACHE_FILE.unlink(missing_ok=True)
         # Clear statement JSON cache too
@@ -1599,6 +1602,20 @@ with st.sidebar:
         st.caption(f"{len(uploaded_receipts)} receipt(s) ready")
     if uploaded_statement:
         st.caption(f"1 statement ready")
+
+# ---- Parse Statement (Debug) ----
+if parse_stmt_clicked:
+    if uploaded_statement:
+        dest = UPLOAD_DIR_STATEMENTS / uploaded_statement.name
+        dest.write_bytes(uploaded_statement.getbuffer())
+        with st.sidebar:
+            st.info("Running DocTR OCR on statement…")
+        pages = process_statement_pdf(str(dest))
+        st.session_state["raw_ocr_pages"] = pages
+        n_words = sum(len(p.get("raw_ocr_words", [])) for p in pages)
+        st.sidebar.success(f"OCR done — {len(pages)} page(s), {n_words} word(s) extracted")
+    else:
+        st.sidebar.warning("Upload a statement PDF first.")
 
 # ---- Processing ----
 if process_clicked:
@@ -2080,13 +2097,14 @@ def _sync_edits_back(edited_df: pd.DataFrame, orig_indices):
 # Main area: 5 Tabs
 # ---------------------------------------------------------------------------
 
-tab_high, tab_review, tab_unmatched, tab_credits, tab_compare = st.tabs(
+tab_high, tab_review, tab_unmatched, tab_credits, tab_compare, tab_raw_ocr = st.tabs(
     [
         "Auto-Approved",
         "Needs Review",
         "Unmatched",
         "Credits",
         "Receipt vs Transaction",
+        "🔍 Raw OCR",
     ]
 )
 
@@ -2677,3 +2695,69 @@ with tab_compare:
                                      key=f"ocr_debug_{receipt_name}", disabled=True)
     else:
         st.info("Process receipts to see OCR debug output.")
+
+# ---------------------------------------------------------------------------
+# Tab: Raw OCR — shows exactly what DocTR extracted before any row building
+# ---------------------------------------------------------------------------
+with tab_raw_ocr:
+    st.subheader("Raw DocTR OCR Output")
+    raw_pages = st.session_state.get("raw_ocr_pages")
+    if raw_pages:
+        st.caption(
+            f"{len(raw_pages)} page(s) — click **🔍 Parse Statement (Debug)** in the sidebar to refresh"
+        )
+        for pg in raw_pages:
+            pg_num = pg.get("page_number", "?")
+            words = pg.get("raw_ocr_words", [])
+            status = pg.get("status", "unknown")
+            with st.expander(f"Page {pg_num}  —  {len(words)} words  ({status})", expanded=(pg_num <= 3)):
+                if words:
+                    df_words = pd.DataFrame([
+                        {
+                            "text": w["text"],
+                            "confidence": round(w["confidence"], 3),
+                            "x_min": round(w["x_min"], 4),
+                            "y_min": round(w["y_min"], 4),
+                            "x_max": round(w["x_max"], 4),
+                            "y_max": round(w["y_max"], 4),
+                            "has_plus": w.get("has_plus_prefix", False),
+                        }
+                        for w in words
+                    ])
+                    st.dataframe(df_words, use_container_width=True, hide_index=True)
+
+                    # Also show the words ordered by Y then X so you can read the rows
+                    st.markdown("**Sorted by row (Y → X) — how text appears on page:**")
+                    sorted_words = sorted(words, key=lambda w: (round(w["y_min"], 3), w["x_min"]))
+                    # Group into visual lines (Y within 0.01 tolerance)
+                    lines = []
+                    cur_line = []
+                    cur_y = None
+                    for w in sorted_words:
+                        if cur_y is None or abs(w["y_min"] - cur_y) < 0.012:
+                            cur_line.append(w["text"])
+                            if cur_y is None:
+                                cur_y = w["y_min"]
+                        else:
+                            lines.append("  ".join(cur_line))
+                            cur_line = [w["text"]]
+                            cur_y = w["y_min"]
+                    if cur_line:
+                        lines.append("  ".join(cur_line))
+
+                    st.code("\n".join(lines), language=None)
+                else:
+                    st.warning("No words extracted for this page.")
+
+        # Also show built rows if available (from a previous Process run)
+        built_rows = st.session_state.get("qwen_input_rows")
+        if built_rows:
+            st.divider()
+            st.markdown(f"**build_rows() output — {len(built_rows)} rows reconstructed:**")
+            for i, r in enumerate(built_rows):
+                st.text(f"{i+1:3d}: {r}")
+    else:
+        st.info(
+            "Upload a statement PDF, then click **🔍 Parse Statement (Debug)** in the sidebar "
+            "to see raw DocTR word output."
+        )

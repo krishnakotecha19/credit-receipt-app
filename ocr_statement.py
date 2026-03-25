@@ -25,6 +25,15 @@ os.environ["OMP_NUM_THREADS"] = "1"
 # Leading +/- is optional so DocTR-merged tokens like "+7,627.00" are recognised.
 _AMT_RE = re.compile(r"^[+\-]?\d[\d,]*\.\d{2}$")
 
+# Cleans up amounts where DocTR merges trailing characters:
+#   "7,627.002" or "7,627.001" → "7,627.00"  (trailing row-index digit)
+#   "3,598.26R" → "3,598.26"  (trailing credit marker 'R')
+_TRAIL_CLEANUP = re.compile(r'^([+\-]?\d[\d,]*\.\d{2})(\d|[Rr])$')
+
+# Cleans up dates where DocTR merges the trailing row-index digit:
+#   "25/02/20261" → "25/02/2026"
+_DATE_TRAIL_CLEANUP = re.compile(r'^(\d{2}[/\-]\d{2}[/\-]\d{2,4})\d$')
+
 # ---------------------------------------------------------------------------
 # DocTR engine (one-time init per process)
 # ---------------------------------------------------------------------------
@@ -122,10 +131,43 @@ def process_statement_pdf(pdf_path: str, poppler_path: str = None) -> list[dict]
 
                     raw_text = word.value
 
+                    # ── Pre-clean dates ──────────────────────────────────────
+                    # DocTR sometimes merges the row-index digit into the date
+                    # if they are printed too close together (e.g. "25/02/20261")
+                    _dtc = _DATE_TRAIL_CLEANUP.match(raw_text)
+                    if _dtc:
+                        raw_text = _dtc.group(1)
+
+                    # ── Pre-clean amount tokens ──────────────────────────────
+                    # DocTR sometimes merges adjacent characters into one token:
+                    #  (a) Trailing digit: row-index digit merged into amount
+                    #      e.g. "7,627.002" → "7,627.00"
+                    #  (b) Trailing "R": credit marker merged into amount column is read as part of the
+                    #      amount, producing "7,627.002" instead of "7,627.00".
+                    #      Detect: token looks like a valid amount PLUS one extra
+                    #      trailing digit that is NOT part of the 2-decimal format.
+                    #
+                    #  (b) Trailing "R" credit marker: the statement prints "R"
+                    #      immediately after credit amounts ("3,598.26R").
+                    #      Strip "R" and set the credit flag.
+                    #
+                    # We handle this BEFORE _AMT_RE so downstream code always
+                    # sees a clean "D,DDD.DD" amount token.
+                    _tc = _TRAIL_CLEANUP.match(raw_text)
+                    if _tc:
+                        raw_text = _tc.group(1)          # strip trailing char
+                        if _tc.group(2).upper() == 'R':
+                            # "R" = credit indicator on this statement; we will
+                            # propagate this as has_plus_prefix below.
+                            pass  # handled after plus_prefix logic below
+
                     # --- Credit detection ---
                     # Strategy 1: DocTR includes '+' directly in the token value
                     # (e.g. "+7,627.00").  Strip it and mark as credit.
                     plus_prefix = False
+                    # Also mark credit if the original token had trailing "R"
+                    if _tc and _tc.group(2).upper() == 'R':
+                        plus_prefix = True
                     if raw_text.startswith("+") and _AMT_RE.match(raw_text):
                         plus_prefix = True
                         raw_text = raw_text[1:]  # strip leading '+' for clean numeric text
