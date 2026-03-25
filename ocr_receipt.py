@@ -664,7 +664,7 @@ def _run_ocr_on_image(img: np.ndarray) -> tuple[list[str], list[float]]:
 
 # ---------------------------------------------------------------------------
 # LLM-based extraction via Hugging Face VLM — sends the receipt IMAGE
-# directly to a vision-language model for accurate parsing
+# directly to a vision-language model for accurate parsinggggg
 # ---------------------------------------------------------------------------
 
 def _parse_llm_response(text: str) -> dict | None:
