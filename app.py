@@ -401,6 +401,7 @@ def build_rows(ocr_pages: list[dict]) -> tuple[list[str], list[float]]:
 
     all_rows = []
     all_confs = []
+    debug_rows_list = []  # per-row debug info for Raw OCR tab
 
     for page_data in ocr_pages:
         if page_data.get("status") != "success":
@@ -627,6 +628,24 @@ def build_rows(ocr_pages: list[dict]) -> tuple[list[str], list[float]]:
                 
             row_text = " | ".join(cleaned_cols)
 
+            # ── Debug: capture per-row word details for Raw OCR tab ──
+            _row_debug = {
+                "row_text": row_text,
+                "is_credit": is_credit,
+                "amount_col_idx": amount_col_idx,
+                "num_columns": len(columns),
+                "all_words": [w["text"] for w in row_words],
+            }
+            if amount_col_idx >= 0 and amount_col_idx < len(columns):
+                _row_debug["amount_col_words"] = [w["text"] for w in columns[amount_col_idx]]
+                _row_debug["amount_col_has_plus"] = [w.get("has_plus_prefix", False) for w in columns[amount_col_idx]]
+                # Check columns adjacent to amount for R/Cr/+ words
+                if amount_col_idx > 0:
+                    _row_debug["col_before_amount"] = [w["text"] for w in columns[amount_col_idx - 1]]
+                if amount_col_idx + 1 < len(columns):
+                    _row_debug["col_after_amount"] = [w["text"] for w in columns[amount_col_idx + 1]]
+            debug_rows_list.append(_row_debug)
+
             all_rows.append(row_text)
             avg_conf = sum(w["confidence"] for w in row_words) / len(row_words)
             all_confs.append(avg_conf)
@@ -699,6 +718,7 @@ def build_rows(ocr_pages: list[dict]) -> tuple[list[str], list[float]]:
         all_rows = merged_rows
         all_confs = merged_confs
 
+    st.session_state["debug_row_words"] = debug_rows_list
     return all_rows, all_confs
 
 
@@ -1431,6 +1451,30 @@ def parse_rows_columnar(rows: list[str]) -> list[dict]:
         desc = _HTTPS_RE.sub('', desc)
         desc = _TRAILING_R_RE.sub('', desc)
         desc = desc.strip(' |-')
+
+        # ── Keyword-based credit detection (fallback) ──────────────────
+        # Some credit card statements (e.g. HDFC) have NO OCR-visible
+        # credit markers (no +, no R, no Cr). Credits are only
+        # distinguishable by transaction description keywords.
+        if not is_credit:
+            desc_upper = desc.upper()
+            _CREDIT_KEYWORDS = [
+                "AUTOPAY",          # credit card payment
+                "AUTO PAY",
+                "PAYMENT RECEIVED",
+                "PAYMENT THANK",
+                "REFUND",
+                "REVERSAL",
+                "CASHBACK",
+                "CASH BACK",
+                "CREDIT VOUCHER",
+                "REWARD",
+                "EMI CANCEL",
+            ]
+            for kw in _CREDIT_KEYWORDS:
+                if kw in desc_upper:
+                    is_credit = True
+                    break
 
         # ── Parse amount value (always float with 2 decimal places) ──
         if amt_match:
@@ -3375,6 +3419,24 @@ with tab_raw_ocr:
             st.markdown(f"**build_rows() output — {len(built_rows)} rows reconstructed:**")
             for i, r in enumerate(built_rows):
                 st.text(f"{i+1:3d}: {r}")
+
+        # Show per-row credit detection debug info
+        debug_row_words = st.session_state.get("debug_row_words")
+        if debug_row_words:
+            st.divider()
+            st.markdown("**🔍 Credit Detection Debug (per row):**")
+            for i, dbg in enumerate(debug_row_words):
+                credit_flag = "✅ CREDIT" if dbg.get("is_credit") else "❌ debit"
+                amt_words = dbg.get("amount_col_words", [])
+                has_plus = dbg.get("amount_col_has_plus", [])
+                col_before = dbg.get("col_before_amount", [])
+                col_after = dbg.get("col_after_amount", [])
+                row_text = dbg.get("row_text", "")[:80]
+                st.text(
+                    f"{i+1:3d} [{credit_flag}] amt_words={amt_words} "
+                    f"plus={has_plus} before={col_before} after={col_after}\n"
+                    f"     → {row_text}"
+                )
     else:
         st.info(
             "Upload a statement PDF, then click **🔍 Parse Statement (Debug)** in the sidebar "
