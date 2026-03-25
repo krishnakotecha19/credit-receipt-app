@@ -28,11 +28,11 @@ _AMT_RE = re.compile(r"^[+\-]?\d[\d,]*\.\d{2}$")
 # Cleans up amounts where DocTR merges trailing characters:
 #   "7,627.002" or "7,627.001" → "7,627.00"  (trailing row-index digit)
 #   "3,598.26R" → "3,598.26"  (trailing credit marker 'R')
-_TRAIL_CLEANUP = re.compile(r'^([+\-]?\d[\d,]*\.\d{2})(\d|[Rr])$')
+_TRAIL_CLEANUP = re.compile(r'^([+\-]?\d[\d,]*\.\d{2})(\d{1,3}|[Rr])$')
 
 # Cleans up dates where DocTR merges the trailing row-index digit:
 #   "25/02/20261" → "25/02/2026"
-_DATE_TRAIL_CLEANUP = re.compile(r'^(\d{2}[/\-]\d{2}[/\-]\d{2,4})\d$')
+_DATE_TRAIL_CLEANUP = re.compile(r'^(\d{2}[/\-]\d{2}[/\-]\d{2,4})\d{1,3}$')
 
 # ---------------------------------------------------------------------------
 # DocTR engine (one-time init per process)
@@ -129,7 +129,7 @@ def process_statement_pdf(pdf_path: str, poppler_path: str = None) -> list[dict]
                         continue
                     (x_min, y_min), (x_max, y_max) = word.geometry
 
-                    raw_text = word.value
+                    raw_text = word.value.strip()
 
                     # ── Pre-clean dates ──────────────────────────────────────
                     # DocTR sometimes merges the row-index digit into the date
