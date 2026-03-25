@@ -688,13 +688,20 @@ def build_rows(ocr_pages: list[dict]) -> tuple[list[str], list[float]]:
 
 
 def build_raw_text_rows(ocr_pages: list[dict]) -> tuple[list[str], list[float]]:
-    """Build simple left-to-right text rows from raw OCR words.
+    """Build pipe-separated transaction rows from raw OCR words.
 
-    Uses the same simple Y-grouping as the Raw OCR debug display:
-    sort by Y→X, group words within Y tolerance, join with spaces.
+    Three-phase approach:
+      Phase 1 — Dynamic Y-clustering: compute y_mid for every word, sort,
+                find natural gaps between rows via gap analysis (percentile),
+                cluster words into row buckets.
+      Phase 2 — Horizontal welding: within each bucket, sort by x_min,
+                detect column breaks using X-gap analysis, join with ' | '.
+      Phase 3 — Vertical welding: if Row N has Date but no Amount, and
+                Row N+1 has Amount but no Date, merge into one virtual row.
 
-    No column detection, no pipe separation — just raw text per visual row.
-    This preserves the exact structure visible in the OCR debug.
+    Output: list of pipe-separated strings like
+        "25/02/2026 | 14:06 MAKE MY TRIP | 7,627.00"
+    matching the clean structure visible in the Raw OCR debug tab.
 
     Returns:
         Tuple of (row_strings, ocr_confidences).
@@ -708,7 +715,6 @@ def build_raw_text_rows(ocr_pages: list[dict]) -> tuple[list[str], list[float]]:
         r"|\d{1,2}\s+(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)[a-z]*\s*\d{2,4}"
         , re.IGNORECASE
     )
-    Y_TOLERANCE = 0.012  # same as Raw OCR debug display
 
     all_rows = []
     all_confs = []
@@ -721,46 +727,150 @@ def build_raw_text_rows(ocr_pages: list[dict]) -> tuple[list[str], list[float]]:
         if not words:
             continue
 
-        # Sort by Y then X (top-to-bottom, left-to-right)
-        sorted_words = sorted(words, key=lambda w: (round(w["y_min"], 3), w["x_min"]))
+        # ── Phase 1: Dynamic Y-clustering ────────────────────────────────
+        # Compute y_mid for each word
+        for w in words:
+            w["y_mid"] = (w["y_min"] + w["y_max"]) / 2.0
 
-        # Group into visual rows using Y proximity
+        # Sort by y_mid
+        words.sort(key=lambda w: w["y_mid"])
+
+        # Compute all gaps between consecutive y_mid values
+        y_mids = [w["y_mid"] for w in words]
+        gaps = []
+        for i in range(1, len(y_mids)):
+            g = y_mids[i] - y_mids[i - 1]
+            if g > 0.0005:  # ignore near-zero gaps (same-line words)
+                gaps.append((g, i))  # (gap_size, index_where_gap_occurs)
+
+        # Find the dynamic threshold: use the gap distribution
+        # Words within the same row have small gaps (< row spacing)
+        # Words across rows have large gaps (>= row spacing)
+        if gaps:
+            gap_sizes = sorted(g for g, _ in gaps)
+            # Use 40th percentile of gaps as the boundary between
+            # intra-row and inter-row gaps
+            p40 = gap_sizes[int(len(gap_sizes) * 0.4)]
+            # Row break threshold: midpoint between intra-row and inter-row gaps
+            # At minimum 0.004, at maximum 0.025
+            row_threshold = max(0.004, min(p40 * 1.5, 0.025))
+        else:
+            row_threshold = 0.010
+
+        # Cluster words into rows using the dynamic threshold
         row_groups: list[list[dict]] = []
-        cur_group: list[dict] = []
-        cur_y = None
+        cur_group: list[dict] = [words[0]]
 
-        for w in sorted_words:
-            if cur_y is None or abs(w["y_min"] - cur_y) < Y_TOLERANCE:
-                cur_group.append(w)
-                if cur_y is None:
-                    cur_y = w["y_min"]
+        for i in range(1, len(words)):
+            gap = words[i]["y_mid"] - words[i - 1]["y_mid"]
+            if gap < row_threshold:
+                cur_group.append(words[i])
             else:
-                if cur_group:
-                    row_groups.append(cur_group)
-                cur_group = [w]
-                cur_y = w["y_min"]
+                row_groups.append(cur_group)
+                cur_group = [words[i]]
         if cur_group:
             row_groups.append(cur_group)
 
+        # ── Phase 2: Horizontal welding — build pipe-separated columns ───
+        # Compute X-gap threshold for column detection across all rows
+        all_x_gaps = []
         for group in row_groups:
-            # Sort left-to-right within row
+            group.sort(key=lambda w: w["x_min"])
+            for j in range(1, len(group)):
+                xg = group[j]["x_min"] - group[j - 1].get("x_max", group[j - 1]["x_min"])
+                if xg > 0:
+                    all_x_gaps.append(xg)
+
+        if all_x_gaps:
+            all_x_gaps.sort()
+            median_x_gap = all_x_gaps[len(all_x_gaps) // 2]
+            col_gap_threshold = max(median_x_gap * 3, 0.03)
+        else:
+            col_gap_threshold = 0.05
+
+        page_rows = []
+        page_confs = []
+
+        for group in row_groups:
             group.sort(key=lambda w: w["x_min"])
 
-            # Build text: join words with spaces, mark credits with +
-            parts = []
-            has_credit = False
-            for w in group:
-                t = w["text"].strip()
-                if w.get("has_plus_prefix"):
-                    has_credit = True
-                if t.startswith("+") and re.match(r"^\+\d", t):
-                    has_credit = True
-                parts.append(t)
+            # Split into columns at large X gaps
+            columns: list[list[dict]] = []
+            cur_col = [group[0]]
+            for j in range(1, len(group)):
+                xg = group[j]["x_min"] - group[j - 1].get("x_max", group[j - 1]["x_min"])
+                if xg > col_gap_threshold:
+                    columns.append(cur_col)
+                    cur_col = [group[j]]
+                else:
+                    cur_col.append(group[j])
+            columns.append(cur_col)
 
-            row_text = "  ".join(parts)
+            # Identify amount column (rightmost column with a decimal number)
+            amount_col_idx = -1
+            for ci in range(len(columns) - 1, -1, -1):
+                col_text = " ".join(w["text"] for w in columns[ci])
+                if _AMT_COL_RE.search(col_text):
+                    amount_col_idx = ci
+                    break
+
+            # Build column texts with credit detection
+            col_texts = []
+            is_credit = False
+
+            for ci, col_words in enumerate(columns):
+                if ci == amount_col_idx:
+                    # Credit detection
+                    if any(w.get("has_plus_prefix") for w in col_words):
+                        is_credit = True
+                    if any(w["text"].strip() == "+" for w in col_words):
+                        is_credit = True
+                    if ci > 0:
+                        prev_col = " ".join(w["text"] for w in columns[ci - 1]).strip()
+                        if prev_col == "+":
+                            is_credit = True
+                            if col_texts and col_texts[-1].strip() == "+":
+                                col_texts.pop()
+
+                    # Build amount text — skip standalone row-index digits
+                    amt_parts = []
+                    for w in col_words:
+                        t = w["text"].strip()
+                        if t.startswith("+") and re.match(r"^\+\d", t):
+                            is_credit = True
+                            t = t[1:]
+                        if t in ("+", "-"):
+                            continue
+                        if re.fullmatch(r"\d{1,3}", t):
+                            continue  # stale row-index artifact
+                        amt_parts.append(t)
+                    raw_amt = " ".join(amt_parts)
+
+                    # Extract canonical amount
+                    canon = _CANON_AMT_RE.findall(raw_amt)
+                    amt_text = canon[-1] if canon else raw_amt
+
+                    # Strip bogus ₹-as-2
+                    desc_so_far = " ".join(col_texts[1:]) if len(col_texts) > 1 else ""
+                    amt_text = _strip_bogus_rupee_2(
+                        ("+" + amt_text) if is_credit else amt_text,
+                        desc_so_far,
+                    )
+                    if is_credit and not amt_text.startswith("+"):
+                        amt_text = "+" + amt_text
+
+                    col_texts.append(amt_text)
+                else:
+                    col_texts.append(" ".join(w["text"] for w in col_words))
+
+            # Drop trailing bare-digit columns (stale row indices)
+            while len(col_texts) > 2 and re.fullmatch(r"\d{1,3}", col_texts[-1].strip()):
+                col_texts.pop()
+
+            row_text = " | ".join(col_texts)
             row_lower = row_text.lower()
 
-            # Skip headers/junk
+            # Skip headers
             if any(hw in row_lower for hw in _HEADER_WORDS):
                 continue
 
@@ -770,18 +880,83 @@ def build_raw_text_rows(ocr_pages: list[dict]) -> tuple[list[str], list[float]]:
             if not has_date and not has_amount:
                 continue
 
-            # Mark credit rows with + prefix on the amount
-            if has_credit and has_amount:
-                # Find the rightmost amount and ensure it has + prefix
-                amt_match = None
-                for m in re.finditer(r"\d[\d,]*\.\d{2}", row_text):
-                    amt_match = m
-                if amt_match and row_text[amt_match.start() - 1:amt_match.start()] != "+":
-                    row_text = row_text[:amt_match.start()] + "+" + row_text[amt_match.start():]
+            # Clean description columns
+            cleaned_cols = row_text.split(" | ")
+            if len(cleaned_cols) >= 3:
+                for mid_ci in range(1, len(cleaned_cols) - 1):
+                    d = cleaned_cols[mid_ci]
+                    d = _LEADING_IDX_RE.sub("", d, count=1)
+                    d = _HTTPS_RE.sub("", d)
+                    d = _TRAILING_R_RE.sub("", d)
+                    cleaned_cols[mid_ci] = d.strip()
+                row_text = " | ".join(cleaned_cols)
 
-            all_rows.append(row_text)
+            page_rows.append(row_text)
             avg_conf = sum(w["confidence"] for w in group) / len(group)
-            all_confs.append(avg_conf)
+            page_confs.append(avg_conf)
+
+        # ── Phase 3: Vertical welding — merge fragment rows ─────────────
+        # If Row N has date but no amount, and Row N+1 has amount but no
+        # date, they are fragments of the same transaction — merge them.
+        if len(page_rows) > 1:
+            merged = []
+            merged_c = []
+            i = 0
+            while i < len(page_rows):
+                rt = page_rows[i]
+                rc = page_confs[i]
+                hd = bool(_DATE_RE.search(rt))
+                ha = bool(_HAS_AMOUNT_RE.search(rt))
+
+                if hd and ha:
+                    merged.append(rt)
+                    merged_c.append(rc)
+                    i += 1
+                elif hd and not ha and i + 1 < len(page_rows):
+                    nxt = page_rows[i + 1]
+                    nhd = bool(_DATE_RE.search(nxt))
+                    nha = bool(_HAS_AMOUNT_RE.search(nxt))
+                    if nha and not nhd:
+                        merged.append(rt + " | " + nxt)
+                        merged_c.append((rc + page_confs[i + 1]) / 2)
+                        i += 2
+                    else:
+                        merged.append(rt)
+                        merged_c.append(rc)
+                        i += 1
+                elif ha and not hd:
+                    # Amount-only: try attaching to previous row
+                    if merged and bool(_DATE_RE.search(merged[-1])) \
+                            and not bool(_HAS_AMOUNT_RE.search(merged[-1])):
+                        merged[-1] = merged[-1] + " | " + rt
+                        merged_c[-1] = (merged_c[-1] + rc) / 2
+                        i += 1
+                    elif i + 1 < len(page_rows):
+                        nxt = page_rows[i + 1]
+                        nhd = bool(_DATE_RE.search(nxt))
+                        nha = bool(_HAS_AMOUNT_RE.search(nxt))
+                        if nhd and not nha:
+                            merged.append(nxt + " | " + rt)
+                            merged_c.append((rc + page_confs[i + 1]) / 2)
+                            i += 2
+                        else:
+                            merged.append(rt)
+                            merged_c.append(rc)
+                            i += 1
+                    else:
+                        merged.append(rt)
+                        merged_c.append(rc)
+                        i += 1
+                else:
+                    merged.append(rt)
+                    merged_c.append(rc)
+                    i += 1
+
+            page_rows = merged
+            page_confs = merged_c
+
+        all_rows.extend(page_rows)
+        all_confs.extend(page_confs)
 
     return all_rows, all_confs
 
@@ -811,27 +986,27 @@ def parse_raw_rows_with_llm(raw_rows: list[str], ocr_pages: list[dict] = None) -
 
         prompt = (
             "You are parsing credit card statement rows from OCR output.\n"
-            "Each row is a single transaction line read left-to-right from the page.\n"
-            "The format is: DATE  TIME  MERCHANT/DESCRIPTION  AMOUNT\n"
-            "Words are separated by spaces. The date is always first, amount is always last.\n\n"
+            "Each row is a single transaction. Columns are separated by | (pipe).\n"
+            "Format: DATE | DESCRIPTION | AMOUNT\n\n"
             "RULES:\n"
-            "- date: Convert to YYYY-MM-DD format. Dates are DD/MM/YYYY or DD/MM/YY.\n"
-            "- description: The merchant/vendor name between the date/time and amount. "
+            "- date: The FIRST column. Convert DD/MM/YYYY or DD/MM/YY to YYYY-MM-DD.\n"
+            "- description: The MIDDLE column(s). The merchant/vendor name. "
             "Remove: leading row-index digits (like '1', '2'), HH:MM timestamps, "
             "Ref# IDs, HTTPS URLs, trailing 'R' characters. Keep merchant name intact.\n"
-            "- amount: The LAST number with decimals (e.g., 7,627.00). "
+            "- amount: The LAST column (after the last |). It is the INR amount. "
             "Remove commas. Return as plain float.\n"
             "  * If amount starts with + it is type=credit, otherwise type=debit.\n"
             "  * IMPORTANT: The ₹ symbol is often misread as digit '2' by OCR. "
             "If you see a suspicious leading '2' before the amount (like 245,678.00 "
             "where the real amount should be 45,678.00), strip the bogus '2'.\n"
             "- INCLUDE ALL rows — fees, taxes, payments, everything. NEVER skip a row.\n"
+            "- Output EXACTLY one JSON object per input ROW.\n"
             "- If a field is unclear, make your best guess.\n\n"
             "Examples:\n"
-            "ROW1: 25/02/2026  14:06  MAKE MY TRIP INDIA PVT L  7,627.00\n"
-            "ROW2: 27/01/2026  00:00  IRCTC MPP NEW DELHI  +3,598.26\n"
-            "ROW3: 13/02/2026  1  10:48  ING*MAKE MY TRIP INDI  17,504.00\n"
-            "ROW4: 10/03/2026  21:42  AKFOODSVADODARA  530.00\n\n"
+            "ROW1: 25/02/2026 | 14:06 MAKE MY TRIP INDIA PVT L | 7,627.00\n"
+            "ROW2: 27/01/2026 | 00:00 IRCTC MPP NEW DELHI | +3,598.26\n"
+            "ROW3: 13/02/2026 | 1 10:48 ING*MAKE MY TRIP INDI | 17,504.00\n"
+            "ROW4: 10/03/2026 | 21:42 AKFOODSVADODARA | 530.00\n\n"
             "Output: [\n"
             '  {"date":"2026-02-25","description":"MAKE MY TRIP INDIA PVT L","amount":7627.00,"type":"debit"},\n'
             '  {"date":"2026-01-27","description":"IRCTC MPP NEW DELHI","amount":3598.26,"type":"credit"},\n'
