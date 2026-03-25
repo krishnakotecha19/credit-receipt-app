@@ -372,6 +372,8 @@ _CANON_AMT_RE = re.compile(r"\d[\d,]*\.\d{2}")   # canonical decimal amount extr
 _LEADING_IDX_RE = re.compile(r"^\d{1,3}\s+")       # leading row-index digit(s) e.g. "1 "
 _HTTPS_RE = re.compile(r"\s*HTTPS?://\S*", re.IGNORECASE)  # URL noise
 _TRAILING_R_RE = re.compile(r"\s+R\s*$")            # trailing " R" OCR artifact
+_AMT_COL_RE = re.compile(r"\d[\d,]*\.\d")          # amount column detector
+_HAS_AMOUNT_RE = re.compile(r"\d[\d,]*\.\d{2}")    # row-level amount check
 
 
 def build_rows(ocr_pages: list[dict]) -> tuple[list[str], list[float]]:
@@ -432,15 +434,19 @@ def build_rows(ocr_pages: list[dict]) -> tuple[list[str], list[float]]:
         else:
             row_threshold = 0.008
 
-        # Cluster into rows
+        # Cluster into rows — compare each word to the ROW ANCHOR (first word's Y)
+        # Previously compared to last word's Y, causing drift: each word checked against
+        # the previous one, so a 10-word row could slowly drift into the next row.
         rows_clustered = []
         current_row = [words[0]]
+        row_anchor_y = words[0]["center_y"]  # anchor = first word's Y
         for w in words[1:]:
-            if abs(w["center_y"] - current_row[-1]["center_y"]) < row_threshold:
+            if abs(w["center_y"] - row_anchor_y) < row_threshold:
                 current_row.append(w)
             else:
                 rows_clustered.append(current_row)
                 current_row = [w]
+                row_anchor_y = w["center_y"]  # new anchor for next row
         rows_clustered.append(current_row)
 
         # Compute median word gap on this page to detect column breaks
@@ -462,8 +468,8 @@ def build_rows(ocr_pages: list[dict]) -> tuple[list[str], list[float]]:
         for row_words in rows_clustered:
             row_words.sort(key=lambda w: w["center_x"])
 
-            # Skip too few words
-            if len(row_words) < 2:
+            # Skip rows with no words at all
+            if len(row_words) < 1:
                 continue
 
             # Build columns by detecting X gaps
@@ -482,8 +488,6 @@ def build_rows(ocr_pages: list[dict]) -> tuple[list[str], list[float]]:
             # The amount is always the rightmost column that contains a
             # number with a decimal point.  Check that column's words for
             # '+' (geometric welding or standalone token) to detect credit.
-            _AMT_COL_RE = re.compile(r"\d[\d,]*\.\d")
-
             amount_col_idx = -1
             for ci in range(len(columns) - 1, -1, -1):
                 col_text = " ".join(w["text"] for w in columns[ci])
@@ -549,8 +553,13 @@ def build_rows(ocr_pages: list[dict]) -> tuple[list[str], list[float]]:
             if any(hw in row_lower for hw in _HEADER_WORDS):
                 continue
 
-            # Must contain a date pattern
-            if not _DATE_RE.search(row_text):
+            # Keep row only if it has a date-like pattern OR contains an amount.
+            # We relax the strict date requirement because DocTR may misread one
+            # date character (e.g. '13/02/202G') — as long as there's a decimal
+            # amount present the columnar parser can still use the row.
+            has_date = bool(_DATE_RE.search(row_text))
+            has_amount = bool(_HAS_AMOUNT_RE.search(row_text))
+            if not has_date and not has_amount:
                 continue
 
             # --- Bug 2 fix: clean up description columns (non-amount, non-date) ---

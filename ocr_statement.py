@@ -116,7 +116,7 @@ def process_statement_pdf(pdf_path: str, poppler_path: str = None) -> list[dict]
             for line in block.lines:
                 for word in line.words:
                     conf = float(word.confidence)
-                    if conf < 0.4:
+                    if conf < 0.15:   # was 0.4 — digits on scanned PDFs often score 0.2–0.35
                         continue
                     (x_min, y_min), (x_max, y_max) = word.geometry
 
