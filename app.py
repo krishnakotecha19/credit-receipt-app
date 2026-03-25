@@ -2996,7 +2996,8 @@ with tab_credits:
     if _df_statements is not None and not _df_statements.empty:
         df_cr = _df_statements[_df_statements["type"] == "credit"].reset_index(drop=True)
         if not df_cr.empty:
-            st.dataframe(df_cr, width="stretch", hide_index=True)
+            st.dataframe(df_cr, width="stretch", hide_index=True,
+                         column_config={"amount": st.column_config.NumberColumn(format="%.2f")})
             col_csv, col_xlsx = st.columns(2)
             with col_csv:
                 st.download_button(
@@ -3028,7 +3029,8 @@ with tab_compare:
     # ── Section A: Show all statement transactions extracted by Qwen ──
     if _df_statements is not None and not _df_statements.empty:
         with st.expander("📄 All Statement Transactions (extracted by Qwen)", expanded=False):
-            st.dataframe(_df_statements, width="stretch", hide_index=True)
+            st.dataframe(_df_statements, width="stretch", hide_index=True,
+                         column_config={"amount": st.column_config.NumberColumn(format="%.2f")})
     elif _df_statements is not None:
         st.info("No transactions extracted from statement.")
 
@@ -3314,7 +3316,8 @@ with tab_compare:
                 st.markdown("---")
     elif _df_statements is not None and not _df_statements.empty:
         st.markdown("**Final Statement Transactions**")
-        st.dataframe(_df_statements, hide_index=True, use_container_width=True)
+        st.dataframe(_df_statements, hide_index=True, use_container_width=True,
+                     column_config={"amount": st.column_config.NumberColumn(format="%.2f")})
     else:
         st.info("Process a statement to see debug output here.")
 
