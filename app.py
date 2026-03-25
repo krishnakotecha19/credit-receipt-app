@@ -528,6 +528,10 @@ def build_rows(ocr_pages: list[dict]) -> tuple[list[str], list[float]]:
                             t = t[1:]  # strip the sign
                         if t in ("+", "-"):
                             continue  # consumed for credit detection
+                        # Skip standalone small digits (row-index artifacts like "2", "12")
+                        # that DocTR places in/near the amount column
+                        if re.fullmatch(r"\d{1,3}", t):
+                            continue
                         amt_parts.append(t)
                     raw_amt_text = " ".join(amt_parts)
 
@@ -545,6 +549,11 @@ def build_rows(ocr_pages: list[dict]) -> tuple[list[str], list[float]]:
                         col_texts.append(amt_text)
                 else:
                     col_texts.append(" ".join(w["text"] for w in col_words))
+
+            # Drop trailing columns that are just bare digits (stale row-index
+            # artifacts like "2", "12" that DocTR places after the amount)
+            while len(col_texts) > 2 and re.fullmatch(r"\d{1,3}", col_texts[-1].strip()):
+                col_texts.pop()
 
             row_text = " | ".join(col_texts)
             row_lower = row_text.lower()
@@ -587,6 +596,74 @@ def build_rows(ocr_pages: list[dict]) -> tuple[list[str], list[float]]:
             all_rows.append(row_text)
             avg_conf = sum(w["confidence"] for w in row_words) / len(row_words)
             all_confs.append(avg_conf)
+
+    # ── Post-process: merge fragment rows ──────────────────────────────────
+    # Y-clustering sometimes splits a single transaction into fragments
+    # because the amount column is at a slightly different Y than the
+    # date/description.  This produces:
+    #   Row N  : "25/02/2026 | MERCHANT NAME"   (date+desc, no amount)
+    #   Row N+1: "7,627.00"                     (amount only, no date)
+    # Merge adjacent fragments back into complete rows.
+    if len(all_rows) > 1:
+        merged_rows = []
+        merged_confs = []
+        i = 0
+        while i < len(all_rows):
+            row_text = all_rows[i]
+            row_conf = all_confs[i]
+            has_date = bool(_DATE_RE.search(row_text))
+            has_amount = bool(_HAS_AMOUNT_RE.search(row_text))
+
+            if has_date and has_amount:
+                # Complete row — keep as-is
+                merged_rows.append(row_text)
+                merged_confs.append(row_conf)
+                i += 1
+            elif has_date and not has_amount and i + 1 < len(all_rows):
+                # Date+desc without amount — check if next row is amount-only
+                next_row = all_rows[i + 1]
+                next_has_date = bool(_DATE_RE.search(next_row))
+                next_has_amount = bool(_HAS_AMOUNT_RE.search(next_row))
+                if next_has_amount and not next_has_date:
+                    # Merge: append amount from next row to this row
+                    merged_rows.append(row_text + " | " + next_row)
+                    merged_confs.append((row_conf + all_confs[i + 1]) / 2)
+                    i += 2
+                else:
+                    merged_rows.append(row_text)
+                    merged_confs.append(row_conf)
+                    i += 1
+            elif has_amount and not has_date:
+                # Amount-only — try merging with previous row (date+desc, no amount)
+                if merged_rows and bool(_DATE_RE.search(merged_rows[-1])) \
+                        and not bool(_HAS_AMOUNT_RE.search(merged_rows[-1])):
+                    merged_rows[-1] = merged_rows[-1] + " | " + row_text
+                    merged_confs[-1] = (merged_confs[-1] + row_conf) / 2
+                    i += 1
+                # Or try merging with next row (date+desc, no amount)
+                elif i + 1 < len(all_rows):
+                    next_row = all_rows[i + 1]
+                    next_has_date = bool(_DATE_RE.search(next_row))
+                    next_has_amount = bool(_HAS_AMOUNT_RE.search(next_row))
+                    if next_has_date and not next_has_amount:
+                        merged_rows.append(next_row + " | " + row_text)
+                        merged_confs.append((row_conf + all_confs[i + 1]) / 2)
+                        i += 2
+                    else:
+                        merged_rows.append(row_text)
+                        merged_confs.append(row_conf)
+                        i += 1
+                else:
+                    merged_rows.append(row_text)
+                    merged_confs.append(row_conf)
+                    i += 1
+            else:
+                merged_rows.append(row_text)
+                merged_confs.append(row_conf)
+                i += 1
+
+        all_rows = merged_rows
+        all_confs = merged_confs
 
     return all_rows, all_confs
 
@@ -811,9 +888,11 @@ def parse_rows_columnar(rows: list[str]) -> list[dict]:
       - segment[-1] → amount (+ prefix = credit)
       - segment[1:-1] joined → description (cleaned)
 
-    No LLM, no regex guessing on the full row. Deterministic, instant, never skips.
+    No LLM, no regex guessing on the full row. Deterministic, instant, NEVER
+    skips — every row from build_rows() is structured and must be kept.
     """
-    _AMOUNT_RE = re.compile(r'[+\-]?\d[\d,]*\.\d{2}')
+    _AMOUNT_RE = re.compile(r'[+\-]?\d[\d,]*\.\d{1,2}')
+    _AMOUNT_FALLBACK_RE = re.compile(r'[+\-]?\d[\d,]*\.?\d*')
     _TIME_PREFIX_RE = re.compile(r'^\d{1,2}:\d{2}\s*')
     _LEADING_IDX_RE2 = re.compile(r'^\d{1,3}\s+')
 
@@ -823,43 +902,86 @@ def parse_rows_columnar(rows: list[str]) -> list[dict]:
 
     for row in rows:
         segments = [s.strip() for s in row.split(' | ')]
-        if len(segments) < 2:
-            debug_log.append({"row": row[:80], "status": "SKIP (too few columns)"})
-            continue
+        status_notes = []
 
-        # ── Date: always the first segment ──
+        # ── Date: first segment, best-effort ──
         date_raw = segments[0].split()[0] if segments[0] else ""
         date_norm = _normalize_date(date_raw)
         if not date_norm:
-            debug_log.append({"row": row[:80], "status": f"SKIP (bad date: {date_raw!r})"})
-            continue
+            # Try every segment for a date (DocTR may have reordered columns)
+            for seg in segments[1:]:
+                candidate = seg.split()[0] if seg else ""
+                date_norm = _normalize_date(candidate)
+                if date_norm:
+                    break
+            if not date_norm:
+                # Last resort: keep raw date string so the row isn't lost
+                date_norm = date_raw if date_raw else "UNKNOWN"
+                status_notes.append(f"bad date: {date_raw!r}")
 
-        # ── Amount: always the last segment ──
+        # ── Amount: last segment, with fallback scan ──
+        # If the last segment is a bare digit (stale row-index like "2"),
+        # fall back to the second-to-last segment for the amount.
         amt_seg = segments[-1].strip()
-        is_credit = amt_seg.startswith('+')
         amt_match = _AMOUNT_RE.search(amt_seg)
+        if not amt_match and len(segments) >= 3 and re.fullmatch(r"\d{1,3}", amt_seg):
+            # Last column is a stale row-index digit — use previous column
+            amt_seg = segments[-2].strip()
+            amt_match = _AMOUNT_RE.search(amt_seg)
+            # Drop the stale trailing column from segments so description stays clean
+            segments = segments[:-1]
+
+        # If still no amount in last col, scan ALL segments right-to-left
         if not amt_match:
-            debug_log.append({"row": row[:80], "status": "SKIP (no amount in last col)"})
-            continue
-        # Clean up description: strip leading index digit, timestamp, URL, trailing R
+            for si in range(len(segments) - 2, -1, -1):
+                amt_match = _AMOUNT_RE.search(segments[si])
+                if amt_match:
+                    amt_seg = segments[si].strip()
+                    status_notes.append(f"amount found in col {si}")
+                    break
+
+        # Final fallback: try matching any number at all (no decimal required)
+        if not amt_match:
+            for seg in reversed(segments):
+                amt_match = _AMOUNT_FALLBACK_RE.search(seg)
+                if amt_match and amt_match.group(0).strip():
+                    amt_seg = seg.strip()
+                    status_notes.append("amount fallback (no decimal)")
+                    break
+
+        is_credit = amt_seg.startswith('+') if amt_match else False
+
+        # ── Description: everything in between, cleaned ──
+        if len(segments) >= 3:
+            desc = ' '.join(segments[1:-1])
+        elif len(segments) == 2:
+            desc = ' '.join(segments[0].split()[1:])
+        else:
+            desc = row
+
         desc = _LEADING_IDX_RE2.sub('', desc, count=1)
         desc = _TIME_PREFIX_RE.sub('', desc)
         desc = _HTTPS_RE.sub('', desc)
         desc = _TRAILING_R_RE.sub('', desc)
         desc = desc.strip(' |-')
 
-        # Fix amounts where ₹ was read as '2'
-        amt_match_str = amt_match.group(0)
-        corrected_amt_str = _strip_bogus_rupee_2(amt_match_str, desc)
-        try:
-            amount_val = round(float(corrected_amt_str.lstrip('+-').replace(',', '')), 2)
-        except ValueError:
-            debug_log.append({"row": row[:80], "status": "SKIP (amount parse error)"})
-            continue
+        # ── Parse amount value ──
+        if amt_match:
+            amt_match_str = amt_match.group(0)
+            corrected_amt_str = _strip_bogus_rupee_2(amt_match_str, desc)
+            try:
+                amount_val = round(float(corrected_amt_str.lstrip('+-').replace(',', '')), 2)
+            except ValueError:
+                amount_val = 0.0
+                status_notes.append("amount parse error")
+        else:
+            amount_val = 0.0
+            status_notes.append("no amount found")
 
         if amount_val <= 0:
-            debug_log.append({"row": row[:80], "status": "SKIP (amount <= 0)"})
-            continue
+            status_notes.append("amount <= 0")
+
+        status = "OK" if not status_notes else f"WARN ({'; '.join(status_notes)})"
 
         transactions.append({
             "date": date_norm,
@@ -867,7 +989,7 @@ def parse_rows_columnar(rows: list[str]) -> list[dict]:
             "amount": amount_val,
             "type": "credit" if is_credit else "debit",
         })
-        debug_log.append({"row": row[:80], "status": "OK"})
+        debug_log.append({"row": row[:80], "status": status})
 
     st.session_state["qwen_debug"] = debug_log
     st.session_state["qwen_raw_output"] = transactions

@@ -27,6 +27,7 @@ _AMT_RE = re.compile(r"^[+\-]?\d[\d,]*\.\d{2}$")
 
 # Cleans up amounts where DocTR merges trailing characters:
 #   "7,627.002" or "7,627.001" → "7,627.00"  (trailing row-index digit)
+#   "7,627.0023" → "7,627.00"  (trailing multi-digit row-index e.g. "23")
 #   "3,598.26R" → "3,598.26"  (trailing credit marker 'R')
 _TRAIL_CLEANUP = re.compile(r'^([+\-]?\d[\d,]*\.\d{2})(\d{1,3}|[Rr])$')
 
