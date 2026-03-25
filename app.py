@@ -418,7 +418,7 @@ def build_rows(ocr_pages: list[dict]) -> tuple[list[str], list[float]]:
         # Sort by Y
         words.sort(key=lambda w: w["center_y"])
 
-        # Adaptive row threshold
+        # Adaptive row threshold (used as fallback for center-y distance)
         y_centers = sorted(set(round(w["center_y"], 4) for w in words))
         if len(y_centers) > 3:
             gaps = sorted(
@@ -428,25 +428,44 @@ def build_rows(ocr_pages: list[dict]) -> tuple[list[str], list[float]]:
             )
             if gaps:
                 p40 = gaps[int(len(gaps) * 0.4)]
-                row_threshold = max(0.005, min(p40 * 0.7, 0.015))
+                row_threshold = max(0.005, min(p40 * 0.7, 0.020))
             else:
-                row_threshold = 0.008
+                row_threshold = 0.010
         else:
-            row_threshold = 0.008
+            row_threshold = 0.010
 
-        # Cluster into rows — compare each word to the ROW ANCHOR (first word's Y)
-        # Previously compared to last word's Y, causing drift: each word checked against
-        # the previous one, so a 10-word row could slowly drift into the next row.
+        # Cluster into rows using Y-OVERLAP + center-y fallback.
+        # Primary: word's Y range overlaps >= 30% of its height with
+        #          the row's collective Y range.
+        # Fallback: center_y within row_threshold of the row's median center_y.
+        # This handles amount columns that are vertically offset from the
+        # date/description — as long as they physically overlap, they merge.
         rows_clustered = []
         current_row = [words[0]]
-        row_anchor_y = words[0]["center_y"]  # anchor = first word's Y
+        row_y_min = words[0]["y_min"]
+        row_y_max = words[0]["y_max"]
+        row_center_sum = words[0]["center_y"]
         for w in words[1:]:
-            if abs(w["center_y"] - row_anchor_y) < row_threshold:
+            # Check Y-range overlap
+            overlap = min(row_y_max, w["y_max"]) - max(row_y_min, w["y_min"])
+            word_h = w["y_max"] - w["y_min"]
+            has_overlap = word_h > 0 and overlap >= word_h * 0.3
+
+            # Fallback: center_y distance to row median
+            row_median_y = row_center_sum / len(current_row)
+            center_close = abs(w["center_y"] - row_median_y) < row_threshold
+
+            if has_overlap or center_close:
                 current_row.append(w)
+                row_y_min = min(row_y_min, w["y_min"])
+                row_y_max = max(row_y_max, w["y_max"])
+                row_center_sum += w["center_y"]
             else:
                 rows_clustered.append(current_row)
                 current_row = [w]
-                row_anchor_y = w["center_y"]  # new anchor for next row
+                row_y_min = w["y_min"]
+                row_y_max = w["y_max"]
+                row_center_sum = w["center_y"]
         rows_clustered.append(current_row)
 
         # Compute median word gap on this page to detect column breaks
