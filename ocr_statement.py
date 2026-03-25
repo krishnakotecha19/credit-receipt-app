@@ -21,7 +21,7 @@ import numpy as np
 os.environ["KMP_DUPLICATE_LIB_OK"] = "TRUE"
 os.environ["OMP_NUM_THREADS"] = "1"
 
-_OCR_STMT_VERSION = "v6-trailR-credit"
+_OCR_STMT_VERSION = "v7-green-color-credit"
 print(f"[ocr_statement] Loaded {_OCR_STMT_VERSION}", file=sys.stderr, flush=True)
 
 # Matches amount-like tokens: 1,234.56  +450.00  -1,234.56  etc.
@@ -129,6 +129,51 @@ def _has_plus_prefix(img_rgb: np.ndarray, x_min: float, y_min: float,
     return has_h_stroke and has_v_stroke
 
 
+def _is_green_text(img_rgb: np.ndarray, x_min: float, y_min: float,
+                   x_max: float, y_max: float) -> bool:
+    """Detect if a word's text is printed in GREEN color.
+
+    Credit card statements (e.g. HDFC) print credit amounts in green
+    and debit amounts in black.  DocTR doesn't detect color, so we
+    sample the pixel colors inside the word bounding box and check
+    if the ink is green-dominant.
+
+    Green text criteria:
+      - G channel > R channel by at least 30
+      - G channel > B channel by at least 30
+      - Pixel is actually ink (not white background): max(R,G,B) < 220
+    """
+    h, w = img_rgb.shape[:2]
+
+    y1 = max(0, int(y_min * h))
+    y2 = min(h, int(y_max * h))
+    x1 = max(0, int(x_min * w))
+    x2 = min(w, int(x_max * w))
+
+    if y2 - y1 < 2 or x2 - x1 < 2:
+        return False
+
+    patch = img_rgb[y1:y2, x1:x2]
+    if patch.size == 0:
+        return False
+
+    r = patch[:, :, 0].astype(np.int16)
+    g = patch[:, :, 1].astype(np.int16)
+    b = patch[:, :, 2].astype(np.int16)
+
+    # Ink pixels: not white (at least one channel < 220)
+    is_ink = np.max(patch, axis=2) < 220
+
+    if np.sum(is_ink) < 3:
+        return False  # not enough ink pixels
+
+    # Green-dominant: G > R + 30 AND G > B + 30 among ink pixels
+    is_green = is_ink & (g > r + 30) & (g > b + 30)
+
+    green_ratio = np.sum(is_green) / max(np.sum(is_ink), 1)
+    return green_ratio > 0.3  # at least 30% of ink pixels are green
+
+
 # ---------------------------------------------------------------------------
 # Statement PDF → OCR words
 # ---------------------------------------------------------------------------
@@ -225,15 +270,14 @@ def process_statement_pdf(pdf_path: str, poppler_path: str = None) -> list[dict]
                         plus_prefix = True
                         raw_text = raw_text[1:]  # strip leading '+' for clean numeric text
 
-                    # Strategy 2: Geometric Welding — DISABLED.
-                    # Previously probed dark pixels to the left of amount tokens,
-                    # but this causes false positives on different PDF layouts
-                    # where borders, text, or other marks exist near amounts.
-                    # Credit detection now relies solely on:
-                    #   - Explicit '+' prefix in token text
-                    #   - Trailing 'R' credit marker on the statement
-                    # if not plus_prefix and page_img is not None and _AMT_RE.match(raw_text):
-                    #     plus_prefix = _has_plus_prefix(page_img, x_min, y_min, y_max)
+                    # Strategy 2: Green text color detection.
+                    # Credit card statements (e.g. HDFC) print credit amounts
+                    # in GREEN and debit amounts in BLACK. DocTR can't read
+                    # color, so we sample the pixel colors of the amount token.
+                    if not plus_prefix and page_img is not None and _AMT_RE.match(raw_text):
+                        plus_prefix = _is_green_text(
+                            page_img, x_min, y_min, x_max, y_max
+                        )
 
                     words.append({
                         "text": raw_text,
