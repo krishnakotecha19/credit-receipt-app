@@ -21,8 +21,9 @@ import numpy as np
 os.environ["KMP_DUPLICATE_LIB_OK"] = "TRUE"
 os.environ["OMP_NUM_THREADS"] = "1"
 
-# Matches amount-like tokens: 1,234.56  450.00  etc.
-_AMT_RE = re.compile(r"^\d[\d,]*\.\d{2}$")
+# Matches amount-like tokens: 1,234.56  +450.00  -1,234.56  etc.
+# Leading +/- is optional so DocTR-merged tokens like "+7,627.00" are recognised.
+_AMT_RE = re.compile(r"^[+\-]?\d[\d,]*\.\d{2}$")
 
 # ---------------------------------------------------------------------------
 # DocTR engine (one-time init per process)
@@ -119,16 +120,26 @@ def process_statement_pdf(pdf_path: str, poppler_path: str = None) -> list[dict]
                         continue
                     (x_min, y_min), (x_max, y_max) = word.geometry
 
-                    # Geometric Welding: for amount-like tokens, probe the
-                    # pixel strip to the left for a '+' sign mark.
+                    raw_text = word.value
+
+                    # --- Credit detection ---
+                    # Strategy 1: DocTR includes '+' directly in the token value
+                    # (e.g. "+7,627.00").  Strip it and mark as credit.
                     plus_prefix = False
-                    if page_img is not None and _AMT_RE.match(word.value):
+                    if raw_text.startswith("+") and _AMT_RE.match(raw_text):
+                        plus_prefix = True
+                        raw_text = raw_text[1:]  # strip leading '+' for clean numeric text
+
+                    # Strategy 2: Geometric Welding — for numeric amount tokens,
+                    # probe the pixel strip to the left for a '+' sign mark that
+                    # DocTR failed to emit as a text character.
+                    if not plus_prefix and page_img is not None and _AMT_RE.match(raw_text):
                         plus_prefix = _has_plus_prefix(
                             page_img, x_min, y_min, y_max
                         )
 
                     words.append({
-                        "text": word.value,
+                        "text": raw_text,
                         "confidence": conf,
                         "x_min": float(x_min),
                         "y_min": float(y_min),

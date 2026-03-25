@@ -367,6 +367,13 @@ def _restore_session_state():
 _restore_session_state()
 
 
+# Pre-compiled regexes used in build_rows / parse_rows_fast
+_CANON_AMT_RE = re.compile(r"\d[\d,]*\.\d{2}")   # canonical decimal amount extractor
+_LEADING_IDX_RE = re.compile(r"^\d{1,3}\s+")       # leading row-index digit(s) e.g. "1 "
+_HTTPS_RE = re.compile(r"\s*HTTPS?://\S*", re.IGNORECASE)  # URL noise
+_TRAILING_R_RE = re.compile(r"\s+R\s*$")            # trailing " R" OCR artifact
+
+
 def build_rows(ocr_pages: list[dict]) -> tuple[list[str], list[float]]:
     """Reconstruct table rows from raw OCR words with column structure.
 
@@ -491,7 +498,7 @@ def build_rows(ocr_pages: list[dict]) -> tuple[list[str], list[float]]:
             for ci, col_words in enumerate(columns):
                 if ci == amount_col_idx:
                     # This is the amount column — check for credit
-                    # 1) geometric welding on any word in this column
+                    # 1) geometric welding / DocTR '+' prefix on any word in this column
                     if any(w.get("has_plus_prefix") for w in col_words):
                         is_credit = True
                     # 2) standalone '+' token in this column
@@ -511,10 +518,21 @@ def build_rows(ocr_pages: list[dict]) -> tuple[list[str], list[float]]:
                     amt_parts = []
                     for w in col_words:
                         t = w["text"].strip()
+                        # 4) '+' prefix directly inside a word value (e.g. "+7,627.00")
+                        if t.startswith("+") and re.match(r"^\+\d", t):
+                            is_credit = True
+                            t = t[1:]  # strip the sign
                         if t in ("+", "-"):
                             continue  # consumed for credit detection
                         amt_parts.append(t)
-                    amt_text = " ".join(amt_parts)
+                    raw_amt_text = " ".join(amt_parts)
+
+                    # --- Bug 1 fix: re-extract canonical decimal amount ---
+                    # When DocTR splits "7,627" and "00" as separate tokens,
+                    # joining gives "7,627 00" which LLM or regex may read as
+                    # 762700. Re-extract the last \d[\d,]*.\d{2} match instead.
+                    canon_matches = _CANON_AMT_RE.findall(raw_amt_text)
+                    amt_text = canon_matches[-1] if canon_matches else raw_amt_text
 
                     # Prepend + if credit so the LLM sees it clearly
                     if is_credit:
@@ -534,6 +552,20 @@ def build_rows(ocr_pages: list[dict]) -> tuple[list[str], list[float]]:
             # Must contain a date pattern
             if not _DATE_RE.search(row_text):
                 continue
+
+            # --- Bug 2 fix: clean up description columns (non-amount, non-date) ---
+            # Remove leading row-index digit(s) (e.g. "1 "), trailing " R" OCR
+            # artifacts, and HTTPS URL noise absorbed from statement watermarks.
+            cleaned_cols = row_text.split(" | ")
+            if len(cleaned_cols) >= 3:
+                # Only clean the middle (description) columns, not date or amount
+                for mid_ci in range(1, len(cleaned_cols) - 1):
+                    desc = cleaned_cols[mid_ci]
+                    desc = _LEADING_IDX_RE.sub("", desc, count=1)
+                    desc = _HTTPS_RE.sub("", desc)
+                    desc = _TRAILING_R_RE.sub("", desc)
+                    cleaned_cols[mid_ci] = desc.strip()
+                row_text = " | ".join(cleaned_cols)
 
             all_rows.append(row_text)
             avg_conf = sum(w["confidence"] for w in row_words) / len(row_words)
@@ -595,11 +627,13 @@ def parse_rows_with_llm(rows: list[str]) -> list[dict]:
         List of dicts: date, description, amount, type.
     """
     ollama_url = os.environ.get("OLLAMA_URL", "http://localhost:11434")
-    ollama_model = os.environ.get("OLLAMA_MODEL", "qwen2.5:3b")
+    # Bug 4 fix: use the TEXT model (qwen2.5:3b), not the VISION model (qwen2.5vl:3b).
+    # Statement rows are plain text — sending them to the VLM causes hallucinations.
+    ollama_model = os.environ.get("OLLAMA_TEXT_MODEL", "qwen2.5:3b")
 
     all_transactions = []
     debug_log = []
-    chunk_size = 30  # bigger chunks = fewer LLM calls
+    chunk_size = 15  # 3B model has limited context; 15 rows is safer than 30
 
     st.session_state["qwen_input_rows"] = rows
 
@@ -609,28 +643,37 @@ def parse_rows_with_llm(rows: list[str]) -> list[dict]:
 
         prompt = (
             "Parse these credit card statement rows into JSON.\n"
-            "Each row: date | description columns | amount (rightmost column)\n\n"
+            "Each row format: DATE | DESCRIPTION | AMOUNT\n"
+            "Columns are separated by |\n\n"
             "RULES:\n"
-            "- date: DD/MM/YYYY → YYYY-MM-DD\n"
-            "- description: Extract the MERCHANT/VENDOR NAME only. "
-            "Remove ref IDs, (Ref# ...), timestamps, HTTPS URLs, IGST codes.\n"
-            "- amount: The RIGHTMOST column is the INR amount. "
-            "If it starts with + it is CREDIT, else DEBIT. "
-            "Remove commas and + sign. Return as float.\n"
-            "- Skip IGST/GST/tax/surcharge/fee rows entirely.\n\n"
+            "- date: Convert DD/MM/YYYY to YYYY-MM-DD format.\n"
+            "- description: Use only the MERCHANT/VENDOR NAME. "
+            "Remove: leading single digits (like '1'), HH:MM timestamps, "
+            "Ref# IDs, HTTPS URLs, trailing 'R' characters. Keep the merchant name intact.\n"
+            "- amount: The rightmost column (after the last |) is the INR amount. "
+            "If the amount starts with + it is type=credit, otherwise type=debit. "
+            "Remove commas and the + sign. Return as a plain float (e.g. 7627.00).\n"
+            "- INCLUDE ALL rows, including fees, taxes, and payments.\n"
+            "- If a field is unclear, make your best guess — do NOT skip the row.\n\n"
             "Examples:\n"
-            'ROW: 25/02/2026 | 14:06 MAKE MY TRIP INDIA PVT L | 7,627.00\n'
-            '→ {"date":"2026-02-25","description":"MAKE MY TRIP INDIA PVT L","amount":7627.00,"type":"debit"}\n'
-            'ROW: 27/01/2026 | 00:00 IRCTC MPP NEW DELHI | +3,598.26\n'
-            '→ {"date":"2026-01-27","description":"IRCTC MPP NEW DELHI","amount":3598.26,"type":"credit"}\n\n'
-            "Return ONLY a JSON array.\n\n"
+            'ROW1: 25/02/2026 | 14:06 MAKE MY TRIP INDIA PVT L | 7,627.00\n'
+            'ROW2: 27/01/2026 | 00:00 IRCTC MPP NEW DELHI | +3,598.26\n'
+            'ROW3: 13/02/2026 | 1 10:48 ING*MAKE MY TRIP INDI | 17,504.00\n'
+            'ROW4: 10/03/2026 | 21:42 AKFOODSVADODARA | 530.00\n\n'
+            'Output: [\n'
+            '  {"date":"2026-02-25","description":"MAKE MY TRIP INDIA PVT L","amount":7627.00,"type":"debit"},\n'
+            '  {"date":"2026-01-27","description":"IRCTC MPP NEW DELHI","amount":3598.26,"type":"credit"},\n'
+            '  {"date":"2026-02-13","description":"MAKE MY TRIP INDI","amount":17504.00,"type":"debit"},\n'
+            '  {"date":"2026-03-10","description":"AKFOODSVADODARA","amount":530.00,"type":"debit"}\n'
+            ']\n\n'
+            "Return ONLY a valid JSON array with exactly one object per ROW. No explanations.\n\n"
             f"{rows_text}"
         )
 
         parsed = None
         raw_text = ""
 
-        for attempt in range(1):
+        for attempt in range(3):  # up to 3 attempts per chunk
             try:
                 resp = requests.post(
                     f"{ollama_url}/api/generate",
@@ -638,7 +681,7 @@ def parse_rows_with_llm(rows: list[str]) -> list[dict]:
                         "model": ollama_model,
                         "prompt": prompt,
                         "stream": False,
-                        "options": {"temperature": 0.1, "num_predict": 1500, "num_ctx": 4096},
+                        "options": {"temperature": 0.1, "num_predict": 2000, "num_ctx": 8192},
                     },
                     timeout=120,
                 )
@@ -652,14 +695,24 @@ def parse_rows_with_llm(rows: list[str]) -> list[dict]:
                 cleaned = raw_text.strip()
                 if cleaned.startswith("```"):
                     cleaned = re.sub(r"^```(?:json)?\s*", "", cleaned)
-                    cleaned = re.sub(r"\s*```$", "", cleaned)
+                    cleaned = re.sub(r"\s*```$", "", cleaned.strip())
                 arr_match = re.search(r'\[.*\]', cleaned, re.DOTALL)
                 if arr_match:
                     cleaned = arr_match.group(0)
 
                 parsed = json.loads(cleaned)
                 break
-            except (json.JSONDecodeError, KeyError, ValueError):
+            except json.JSONDecodeError:
+                # Try to recover partial JSON on last attempt
+                if attempt == 2 and raw_text:
+                    # Extract individual JSON objects and reassemble
+                    obj_matches = re.findall(r'\{[^{}]+\}', raw_text, re.DOTALL)
+                    if obj_matches:
+                        try:
+                            parsed = [json.loads(o) for o in obj_matches]
+                            break
+                        except (json.JSONDecodeError, ValueError):
+                            pass
                 continue
             except requests.RequestException as e:
                 debug_log.append({
@@ -684,17 +737,99 @@ def parse_rows_with_llm(rows: list[str]) -> list[dict]:
                         })
             debug_log.append({
                 "row": f"Chunk {chunk_start+1}-{chunk_start+len(chunk)}",
-                "status": f"OK ({len(parsed)} parsed)"
+                "status": f"OK ({len(parsed)} parsed, {len(all_transactions)} total kept)"
             })
         else:
+            # LLM failed all 3 attempts — fall back to regex for this chunk
             debug_log.append({
                 "row": f"Chunk {chunk_start+1}-{chunk_start+len(chunk)}",
-                "status": f"FAILED: {raw_text[:100]}"
+                "status": f"LLM FAILED after 3 attempts, using regex fallback. Raw: {raw_text[:100]}"
             })
+            fallback_txns = parse_rows_fast(chunk)
+            all_transactions.extend(fallback_txns)
 
     st.session_state["qwen_debug"] = debug_log
     st.session_state["qwen_raw_output"] = all_transactions
     return all_transactions
+
+
+
+def parse_rows_columnar(rows: list[str]) -> list[dict]:
+    """PRIMARY parser: directly use the pipe-column structure from build_rows().
+
+    build_rows() already did the spatial work — it separated words into columns
+    using DocTR bounding boxes and joined them as:
+        'DD/MM/YYYY | <time> MERCHANT NAME | [+]1,234.56'
+
+    We trust that structure and simply:
+      - segment[0]  → date
+      - segment[-1] → amount (+ prefix = credit)
+      - segment[1:-1] joined → description (cleaned)
+
+    No LLM, no regex guessing on the full row. Deterministic, instant, never skips.
+    """
+    _AMOUNT_RE = re.compile(r'[+\-]?\d[\d,]*\.\d{2}')
+    _TIME_PREFIX_RE = re.compile(r'^\d{1,2}:\d{2}\s*')
+    _LEADING_IDX_RE2 = re.compile(r'^\d{1,3}\s+')
+
+    transactions = []
+    debug_log = []
+    st.session_state["qwen_input_rows"] = rows
+
+    for row in rows:
+        segments = [s.strip() for s in row.split(' | ')]
+        if len(segments) < 2:
+            debug_log.append({"row": row[:80], "status": "SKIP (too few columns)"})
+            continue
+
+        # ── Date: always the first segment ──
+        date_raw = segments[0].split()[0] if segments[0] else ""
+        date_norm = _normalize_date(date_raw)
+        if not date_norm:
+            debug_log.append({"row": row[:80], "status": f"SKIP (bad date: {date_raw!r})"})
+            continue
+
+        # ── Amount: always the last segment ──
+        amt_seg = segments[-1].strip()
+        is_credit = amt_seg.startswith('+')
+        amt_match = _AMOUNT_RE.search(amt_seg)
+        if not amt_match:
+            debug_log.append({"row": row[:80], "status": "SKIP (no amount in last col)"})
+            continue
+        try:
+            amount_val = round(float(amt_match.group(0).lstrip('+-').replace(',', '')), 2)
+        except ValueError:
+            debug_log.append({"row": row[:80], "status": "SKIP (amount parse error)"})
+            continue
+        if amount_val <= 0:
+            debug_log.append({"row": row[:80], "status": "SKIP (amount <= 0)"})
+            continue
+
+        # ── Description: everything in between, cleaned ──
+        if len(segments) >= 3:
+            desc = ' '.join(segments[1:-1])
+        else:
+            # Only 2 columns — description may be embedded in date column after the date
+            desc = ' '.join(segments[0].split()[1:])  # words after date token
+
+        # Clean up description: strip leading index digit, timestamp, URL, trailing R
+        desc = _LEADING_IDX_RE2.sub('', desc, count=1)
+        desc = _TIME_PREFIX_RE.sub('', desc)
+        desc = _HTTPS_RE.sub('', desc)
+        desc = _TRAILING_R_RE.sub('', desc)
+        desc = desc.strip(' |-')
+
+        transactions.append({
+            "date": date_norm,
+            "description": desc,
+            "amount": amount_val,
+            "type": "credit" if is_credit else "debit",
+        })
+        debug_log.append({"row": row[:80], "status": "OK"})
+
+    st.session_state["qwen_debug"] = debug_log
+    st.session_state["qwen_raw_output"] = transactions
+    return transactions
 
 
 def parse_rows_fast(rows: list[str]) -> list[dict]:
@@ -770,7 +905,12 @@ def parse_rows_fast(rows: list[str]) -> list[dict]:
             if not is_credit and last_amt.group(0).startswith("+"):
                 is_credit = True
 
-        desc = re.sub(r"^\d{1,2}:\d{2}\s*", "", desc).strip(" |-")
+        # Bug 2 fix: clean up description artifacts
+        desc = re.sub(r"^\d{1,3}\s+", "", desc)             # strip leading row-index digit(s) ("1 ")
+        desc = re.sub(r"^\d{1,2}:\d{2}\s*", "", desc)       # strip leading timestamp
+        desc = re.sub(r"\s*HTTPS?://\S*", "", desc, flags=re.IGNORECASE)  # strip URL noise
+        desc = re.sub(r"\s+R\s*$", "", desc)                 # strip trailing " R" artifact
+        desc = desc.strip(" |-")
 
         transactions.append({
             "date": date_normalized,
@@ -1584,15 +1724,23 @@ if process_clicked:
             st.sidebar.warning("  → 0 rows with +/CR found in OCR output")
 
         if rows:
-            # Step 2c: Parse rows — try LLM first (accurate), fall back to regex
-            st.sidebar.info(f"Step 2c — Parsing {len(rows)} rows via Qwen…")
+            # Step 2c: Parse rows — columnar parser is primary (uses pipe structure directly)
+            # LLM is secondary (only if columnar yields too few results)
+            # Regex is last resort
+            st.sidebar.info(f"Step 2c — Parsing {len(rows)} rows…")
             try:
-                qwen_output = parse_rows_with_llm(rows)
-                if not qwen_output:
-                    st.sidebar.warning("LLM returned 0 results, falling back to regex…")
-                    qwen_output = parse_rows_fast(rows)
+                qwen_output = parse_rows_columnar(rows)
+                n_col = len(qwen_output)
+                st.sidebar.caption(f"  → Columnar parser: {n_col} rows")
+                # If columnar got very few results, columns may be badly formed — try LLM
+                if n_col < max(1, len(rows) // 3):
+                    st.sidebar.warning(f"Columnar got only {n_col}/{len(rows)} — trying LLM…")
+                    llm_output = parse_rows_with_llm(rows)
+                    if len(llm_output) > n_col:
+                        qwen_output = llm_output
+                        st.sidebar.caption(f"  → LLM improved to {len(llm_output)} rows")
             except Exception as e:
-                st.sidebar.warning(f"LLM failed ({e}), falling back to regex…")
+                st.sidebar.warning(f"Columnar failed ({e}), falling back to regex…")
                 qwen_output = parse_rows_fast(rows)
 
             # DEBUG: Show credit/debit breakdown
