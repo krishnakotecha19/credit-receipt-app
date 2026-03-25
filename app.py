@@ -687,6 +687,240 @@ def build_rows(ocr_pages: list[dict]) -> tuple[list[str], list[float]]:
     return all_rows, all_confs
 
 
+def build_raw_text_rows(ocr_pages: list[dict]) -> tuple[list[str], list[float]]:
+    """Build simple left-to-right text rows from raw OCR words.
+
+    Uses the same simple Y-grouping as the Raw OCR debug display:
+    sort by Y→X, group words within Y tolerance, join with spaces.
+
+    No column detection, no pipe separation — just raw text per visual row.
+    This preserves the exact structure visible in the OCR debug.
+
+    Returns:
+        Tuple of (row_strings, ocr_confidences).
+    """
+    _HEADER_WORDS = {"statement", "page", "opening", "closing",
+                     "description", "offers", "explore", "credit card",
+                     "gstin", "hsn", "rewards", "unbilled"}
+    _DATE_RE = re.compile(
+        r"\d{2}[/\-]\d{2}[/\-]\d{2,4}"
+        r"|\d{4}[/\-]\d{2}[/\-]\d{2}"
+        r"|\d{1,2}\s+(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)[a-z]*\s*\d{2,4}"
+        , re.IGNORECASE
+    )
+    Y_TOLERANCE = 0.012  # same as Raw OCR debug display
+
+    all_rows = []
+    all_confs = []
+
+    for page_data in ocr_pages:
+        if page_data.get("status") != "success":
+            continue
+
+        words = page_data.get("raw_ocr_words", [])
+        if not words:
+            continue
+
+        # Sort by Y then X (top-to-bottom, left-to-right)
+        sorted_words = sorted(words, key=lambda w: (round(w["y_min"], 3), w["x_min"]))
+
+        # Group into visual rows using Y proximity
+        row_groups: list[list[dict]] = []
+        cur_group: list[dict] = []
+        cur_y = None
+
+        for w in sorted_words:
+            if cur_y is None or abs(w["y_min"] - cur_y) < Y_TOLERANCE:
+                cur_group.append(w)
+                if cur_y is None:
+                    cur_y = w["y_min"]
+            else:
+                if cur_group:
+                    row_groups.append(cur_group)
+                cur_group = [w]
+                cur_y = w["y_min"]
+        if cur_group:
+            row_groups.append(cur_group)
+
+        for group in row_groups:
+            # Sort left-to-right within row
+            group.sort(key=lambda w: w["x_min"])
+
+            # Build text: join words with spaces, mark credits with +
+            parts = []
+            has_credit = False
+            for w in group:
+                t = w["text"].strip()
+                if w.get("has_plus_prefix"):
+                    has_credit = True
+                if t.startswith("+") and re.match(r"^\+\d", t):
+                    has_credit = True
+                parts.append(t)
+
+            row_text = "  ".join(parts)
+            row_lower = row_text.lower()
+
+            # Skip headers/junk
+            if any(hw in row_lower for hw in _HEADER_WORDS):
+                continue
+
+            # Keep only rows with a date or amount
+            has_date = bool(_DATE_RE.search(row_text))
+            has_amount = bool(_HAS_AMOUNT_RE.search(row_text))
+            if not has_date and not has_amount:
+                continue
+
+            # Mark credit rows with + prefix on the amount
+            if has_credit and has_amount:
+                # Find the rightmost amount and ensure it has + prefix
+                amt_match = None
+                for m in re.finditer(r"\d[\d,]*\.\d{2}", row_text):
+                    amt_match = m
+                if amt_match and row_text[amt_match.start() - 1:amt_match.start()] != "+":
+                    row_text = row_text[:amt_match.start()] + "+" + row_text[amt_match.start():]
+
+            all_rows.append(row_text)
+            avg_conf = sum(w["confidence"] for w in group) / len(group)
+            all_confs.append(avg_conf)
+
+    return all_rows, all_confs
+
+
+def parse_raw_rows_with_llm(raw_rows: list[str], ocr_pages: list[dict] = None) -> list[dict]:
+    """Send raw OCR text rows to Qwen LLM for structured parsing.
+
+    Input: simple left-to-right text rows from build_raw_text_rows().
+    Output: list of {date, description, amount, type} dicts.
+
+    The LLM sees the raw text exactly as it appears on the page and
+    extracts the structured fields. This avoids the fragile column
+    detection in build_rows().
+    """
+    ollama_url = os.environ.get("OLLAMA_URL", "http://localhost:11434")
+    ollama_model = os.environ.get("OLLAMA_TEXT_MODEL", "qwen2.5:3b")
+
+    all_transactions = []
+    debug_log = []
+    chunk_size = 15
+
+    st.session_state["qwen_input_rows"] = raw_rows
+
+    for chunk_start in range(0, len(raw_rows), chunk_size):
+        chunk = raw_rows[chunk_start:chunk_start + chunk_size]
+        rows_text = "\n".join(f"ROW{i+1}: {r}" for i, r in enumerate(chunk))
+
+        prompt = (
+            "You are parsing credit card statement rows from OCR output.\n"
+            "Each row is a single transaction line read left-to-right from the page.\n"
+            "The format is: DATE  TIME  MERCHANT/DESCRIPTION  AMOUNT\n"
+            "Words are separated by spaces. The date is always first, amount is always last.\n\n"
+            "RULES:\n"
+            "- date: Convert to YYYY-MM-DD format. Dates are DD/MM/YYYY or DD/MM/YY.\n"
+            "- description: The merchant/vendor name between the date/time and amount. "
+            "Remove: leading row-index digits (like '1', '2'), HH:MM timestamps, "
+            "Ref# IDs, HTTPS URLs, trailing 'R' characters. Keep merchant name intact.\n"
+            "- amount: The LAST number with decimals (e.g., 7,627.00). "
+            "Remove commas. Return as plain float.\n"
+            "  * If amount starts with + it is type=credit, otherwise type=debit.\n"
+            "  * IMPORTANT: The ₹ symbol is often misread as digit '2' by OCR. "
+            "If you see a suspicious leading '2' before the amount (like 245,678.00 "
+            "where the real amount should be 45,678.00), strip the bogus '2'.\n"
+            "- INCLUDE ALL rows — fees, taxes, payments, everything. NEVER skip a row.\n"
+            "- If a field is unclear, make your best guess.\n\n"
+            "Examples:\n"
+            "ROW1: 25/02/2026  14:06  MAKE MY TRIP INDIA PVT L  7,627.00\n"
+            "ROW2: 27/01/2026  00:00  IRCTC MPP NEW DELHI  +3,598.26\n"
+            "ROW3: 13/02/2026  1  10:48  ING*MAKE MY TRIP INDI  17,504.00\n"
+            "ROW4: 10/03/2026  21:42  AKFOODSVADODARA  530.00\n\n"
+            "Output: [\n"
+            '  {"date":"2026-02-25","description":"MAKE MY TRIP INDIA PVT L","amount":7627.00,"type":"debit"},\n'
+            '  {"date":"2026-01-27","description":"IRCTC MPP NEW DELHI","amount":3598.26,"type":"credit"},\n'
+            '  {"date":"2026-02-13","description":"MAKE MY TRIP INDI","amount":17504.00,"type":"debit"},\n'
+            '  {"date":"2026-03-10","description":"AKFOODSVADODARA","amount":530.00,"type":"debit"}\n'
+            "]\n\n"
+            "Return ONLY a valid JSON array with exactly one object per ROW. No explanations.\n\n"
+            f"{rows_text}"
+        )
+
+        parsed = None
+        raw_text = ""
+
+        for attempt in range(3):
+            try:
+                resp = requests.post(
+                    f"{ollama_url}/api/generate",
+                    json={
+                        "model": ollama_model,
+                        "prompt": prompt,
+                        "stream": False,
+                        "options": {"temperature": 0.1, "num_predict": 2000, "num_ctx": 8192},
+                    },
+                    timeout=120,
+                )
+                if resp.status_code != 200:
+                    continue
+
+                raw_text = resp.json().get("response", "")
+                if not raw_text:
+                    continue
+
+                cleaned = raw_text.strip()
+                if cleaned.startswith("```"):
+                    cleaned = re.sub(r"^```(?:json)?\s*", "", cleaned)
+                    cleaned = re.sub(r"\s*```$", "", cleaned.strip())
+                arr_match = re.search(r'\[.*\]', cleaned, re.DOTALL)
+                if arr_match:
+                    cleaned = arr_match.group(0)
+
+                parsed = json.loads(cleaned)
+                break
+            except json.JSONDecodeError:
+                if attempt == 2 and raw_text:
+                    obj_matches = re.findall(r'\{[^{}]+\}', raw_text, re.DOTALL)
+                    if obj_matches:
+                        try:
+                            parsed = [json.loads(o) for o in obj_matches]
+                            break
+                        except (json.JSONDecodeError, ValueError):
+                            pass
+                continue
+            except requests.RequestException:
+                continue
+
+        if parsed and isinstance(parsed, list):
+            for idx, txn in enumerate(parsed):
+                if not isinstance(txn, dict):
+                    continue
+                date_val = str(txn.get("date", ""))
+                desc_val = str(txn.get("description", ""))
+                try:
+                    amt = round(float(txn.get("amount", 0)), 2)
+                except (ValueError, TypeError):
+                    amt = 0.0
+                txn_type = str(txn.get("type", "debit")).lower()
+                if txn_type not in ("credit", "debit"):
+                    txn_type = "debit"
+
+                all_transactions.append({
+                    "date": date_val,
+                    "description": desc_val,
+                    "amount": amt,
+                    "type": txn_type,
+                })
+                debug_log.append({
+                    "row": chunk[idx][:80] if idx < len(chunk) else "",
+                    "status": "OK",
+                })
+        else:
+            # LLM failed for this chunk — fall back to columnar parsing
+            for row in chunk:
+                debug_log.append({"row": row[:80], "status": "LLM_FAIL"})
+
+    st.session_state["qwen_debug"] = debug_log
+    st.session_state["qwen_raw_output"] = all_transactions
+    return all_transactions
+
+
 def _normalize_date(date_str: str) -> str:
     """Convert DD/MM/YYYY, DD-MM-YYYY, DD/MM/YY etc. to YYYY-MM-DD.
     Returns empty string if unparseable."""
@@ -1894,8 +2128,8 @@ if process_clicked:
         progress.empty()
         st.session_state["statement_pages"] = all_statement_pages
 
-        # Step 2b: Build rows from OCR output
-        st.sidebar.info("Step 2b — Reconstructing rows…")
+        # Step 2b: Build raw text rows from OCR output
+        st.sidebar.info("Step 2b — Building raw text rows…")
         # Clear debug state from previous runs
         for k in ["debug_row_layouts", "debug_row_words", "debug_credit_rows",
                    "debug_qwen_credits"]:
@@ -1908,16 +2142,14 @@ if process_clicked:
             n_words = len(pg.get("raw_ocr_words", []))
             st.sidebar.caption(f"  Page {pg_num}: {pg_status} — {n_words} words")
 
-        rows, ocr_confidences = build_rows(all_statement_pages)
-        del all_statement_pages
-        gc.collect()
-
-        st.sidebar.caption(f"  → {len(rows)} row(s) reconstructed")
+        # PRIMARY: simple left-to-right row construction (matches Raw OCR debug)
+        raw_rows, ocr_confidences = build_raw_text_rows(all_statement_pages)
+        st.sidebar.caption(f"  → {len(raw_rows)} raw row(s) built")
 
         # DEBUG: Show rows that contain '+' or 'CR' (potential credits)
         credit_rows_debug = [
-            (i, r) for i, r in enumerate(rows)
-            if "+" in r.split(" | ")[-1] or "CR" in r.upper().split(" | ")[-1]
+            (i, r) for i, r in enumerate(raw_rows)
+            if "+" in r or "CR" in r.upper()
         ]
         st.session_state["debug_credit_rows"] = credit_rows_debug
         if credit_rows_debug:
@@ -1925,25 +2157,38 @@ if process_clicked:
         else:
             st.sidebar.warning("  → 0 rows with +/CR found in OCR output")
 
-        if rows:
-            # Step 2c: Parse rows — columnar parser is primary (uses pipe structure directly)
-            # LLM is secondary (only if columnar yields too few results)
-            # Regex is last resort
-            st.sidebar.info(f"Step 2c — Parsing {len(rows)} rows…")
+        if raw_rows:
+            # Step 2c: Parse rows — LLM (Qwen) is primary, columnar is fallback
+            st.sidebar.info(f"Step 2c — Parsing {len(raw_rows)} rows via LLM…")
+            qwen_output = None
             try:
-                qwen_output = parse_rows_columnar(rows)
-                n_col = len(qwen_output)
-                st.sidebar.caption(f"  → Columnar parser: {n_col} rows")
-                # If columnar got very few results, columns may be badly formed — try LLM
-                if n_col < max(1, len(rows) // 3):
-                    st.sidebar.warning(f"Columnar got only {n_col}/{len(rows)} — trying LLM…")
-                    llm_output = parse_rows_with_llm(rows)
-                    if len(llm_output) > n_col:
-                        qwen_output = llm_output
-                        st.sidebar.caption(f"  → LLM improved to {len(llm_output)} rows")
+                qwen_output = parse_raw_rows_with_llm(raw_rows, all_statement_pages)
+                n_llm = len(qwen_output) if qwen_output else 0
+                st.sidebar.caption(f"  → LLM parsed: {n_llm} rows")
             except Exception as e:
-                st.sidebar.warning(f"Columnar failed ({e}), falling back to regex…")
-                qwen_output = parse_rows_fast(rows)
+                st.sidebar.warning(f"LLM parsing failed ({e})")
+
+            # Fallback: if LLM failed or got too few, use build_rows + columnar
+            if not qwen_output or len(qwen_output) < max(1, len(raw_rows) // 3):
+                st.sidebar.info("Falling back to columnar parser…")
+                rows_structured, ocr_confidences = build_rows(all_statement_pages)
+                st.sidebar.caption(f"  → {len(rows_structured)} structured row(s)")
+                try:
+                    col_output = parse_rows_columnar(rows_structured)
+                    n_col = len(col_output)
+                    st.sidebar.caption(f"  → Columnar parser: {n_col} rows")
+                    if not qwen_output or n_col > len(qwen_output):
+                        qwen_output = col_output
+                        raw_rows = rows_structured  # use structured rows for debug
+                except Exception as e2:
+                    st.sidebar.warning(f"Columnar also failed ({e2}), using regex…")
+                    qwen_output = parse_rows_fast(rows_structured)
+                    raw_rows = rows_structured
+
+            del all_statement_pages
+            gc.collect()
+
+            rows = raw_rows  # for downstream debug/validation
 
             # DEBUG: Show credit/debit breakdown
             qwen_credits = [
