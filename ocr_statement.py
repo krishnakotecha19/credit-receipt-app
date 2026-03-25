@@ -56,38 +56,70 @@ def _has_plus_prefix(img_rgb: np.ndarray, x_min: float, y_min: float,
     a '+' sign that DocTR missed.
 
     Layout (normalised X, measured from real statements):
-        +  sign sits at x_min − 0.020 … x_min − 0.008
-        ₹  symbol sits at x_min − 0.005 … x_min − 0.002
-        amount digits start at x_min
+        +  sign sits at x_min − 0.030 … x_min
+        ₹  symbol may also sit in this zone
 
-    We probe the '+' zone (0.5–2.0% left of x_min), skipping the
-    immediate ₹ symbol zone to avoid false positives.
-
-    This is agnostic to color — it detects ANY mark (black, green, grey)
-    against a white/light background.
+    We probe the full 0–3% strip left of x_min and check specifically
+    for the CROSS pattern of '+' (horizontal + vertical strokes) rather
+    than just "any dark mark".  This distinguishes '+' from '₹' which
+    has horizontal bars but a different vertical structure.
     """
     h, w = img_rgb.shape[:2]
 
-    # Probe strip: skip the ₹ zone (0–0.5%) and check the + zone (0.5–2.0%)
-    probe_x2 = int((x_min - 0.005) * w)
-    probe_x1 = max(0, int((x_min - 0.020) * w))
-    # Vertically: inside the word bbox with 2px inset to avoid row borders
+    # Probe the full strip 0–3% left of x_min
+    probe_x2 = int(x_min * w)
+    probe_x1 = max(0, int((x_min - 0.030) * w))
     probe_y1 = int(y_min * h) + 2
     probe_y2 = int(y_max * h) - 2
 
-    if probe_x1 >= probe_x2 or probe_y1 >= probe_y2:
+    pw = probe_x2 - probe_x1
+    ph = probe_y2 - probe_y1
+    if pw < 4 or ph < 4:
         return False
 
     patch = img_rgb[probe_y1:probe_y2, probe_x1:probe_x2]
     if patch.size == 0:
         return False
 
-    # A mark pixel = any pixel where at least one RGB channel is below 220
-    # (white background is ~255,255,255; any ink/print mark will be darker)
+    # Binary mark mask (any pixel darker than 220 = ink)
     is_mark = np.any(patch < 220, axis=2)
-    mark_ratio = np.sum(is_mark) / is_mark.size
+    total_mark = np.sum(is_mark)
+    if total_mark < 3:
+        return False  # no marks at all
 
-    return mark_ratio > 0.02
+    # --- Cross-pattern detection for '+' ---
+    # A '+' sign has:
+    #   1. A horizontal stroke in the vertical center (~40-60% of height)
+    #   2. A vertical stroke in the horizontal center (~30-70% of width)
+    #
+    # The ₹ symbol has horizontal bars but its vertical component is
+    # off-center (a curved stroke on the left).  By requiring marks
+    # in BOTH the horizontal-center and vertical-center, we detect '+'.
+
+    # Horizontal stroke: project marks onto rows → find rows with marks
+    row_marks = np.sum(is_mark, axis=1)  # marks per row
+    # Vertical stroke: project marks onto columns → find cols with marks
+    col_marks = np.sum(is_mark, axis=0)  # marks per column
+
+    # '+' horizontal stroke → a row near the vertical center has marks
+    # spanning at least 30% of the patch width
+    mid_y_lo = int(ph * 0.25)
+    mid_y_hi = int(ph * 0.75)
+    has_h_stroke = any(
+        row_marks[r] >= pw * 0.20
+        for r in range(mid_y_lo, min(mid_y_hi + 1, ph))
+    )
+
+    # '+' vertical stroke → a column near the horizontal center has marks
+    # spanning at least 30% of the patch height
+    mid_x_lo = int(pw * 0.15)
+    mid_x_hi = int(pw * 0.85)
+    has_v_stroke = any(
+        col_marks[c] >= ph * 0.20
+        for c in range(mid_x_lo, min(mid_x_hi + 1, pw))
+    )
+
+    return has_h_stroke and has_v_stroke
 
 
 # ---------------------------------------------------------------------------
@@ -182,13 +214,15 @@ def process_statement_pdf(pdf_path: str, poppler_path: str = None) -> list[dict]
                         plus_prefix = True
                         raw_text = raw_text[1:]  # strip leading '+' for clean numeric text
 
-                    # Strategy 2: Geometric Welding — for numeric amount tokens,
-                    # probe the pixel strip to the left for a '+' sign mark that
-                    # DocTR failed to emit as a text character.
-                    if not plus_prefix and page_img is not None and _AMT_RE.match(raw_text):
-                        plus_prefix = _has_plus_prefix(
-                            page_img, x_min, y_min, y_max
-                        )
+                    # Strategy 2: Geometric Welding — DISABLED.
+                    # Previously probed dark pixels to the left of amount tokens,
+                    # but this causes false positives on different PDF layouts
+                    # where borders, text, or other marks exist near amounts.
+                    # Credit detection now relies solely on:
+                    #   - Explicit '+' prefix in token text
+                    #   - Trailing 'R' credit marker on the statement
+                    # if not plus_prefix and page_img is not None and _AMT_RE.match(raw_text):
+                    #     plus_prefix = _has_plus_prefix(page_img, x_min, y_min, y_max)
 
                     words.append({
                         "text": raw_text,
