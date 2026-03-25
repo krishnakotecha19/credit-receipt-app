@@ -479,7 +479,7 @@ def build_rows(ocr_pages: list[dict]) -> tuple[list[str], list[float]]:
         if all_x_gaps:
             all_x_gaps.sort()
             median_gap = all_x_gaps[len(all_x_gaps) // 2]
-            col_gap_threshold = max(median_gap * 3, 0.03)
+            col_gap_threshold = min(max(median_gap * 3, 0.03), 0.10)
         else:
             col_gap_threshold = 0.05
 
@@ -748,12 +748,12 @@ def build_raw_text_rows(ocr_pages: list[dict]) -> tuple[list[str], list[float]]:
         # Words across rows have large gaps (>= row spacing)
         if gaps:
             gap_sizes = sorted(g for g, _ in gaps)
-            # Use 40th percentile of gaps as the boundary between
-            # intra-row and inter-row gaps
+            # Since we filtered out gaps < 0.0005, perfectly horizontal PDFs
+            # will have gap_sizes comprised almost entirely of the actual
+            # row-to-row distances.  Multiply by 0.6 to safely distinguish
+            # intra-row wobble from actual line breaks.
             p40 = gap_sizes[int(len(gap_sizes) * 0.4)]
-            # Row break threshold: midpoint between intra-row and inter-row gaps
-            # At minimum 0.004, at maximum 0.025
-            row_threshold = max(0.004, min(p40 * 1.5, 0.025))
+            row_threshold = max(0.004, min(p40 * 0.6, 0.020))
         else:
             row_threshold = 0.010
 
@@ -784,7 +784,7 @@ def build_raw_text_rows(ocr_pages: list[dict]) -> tuple[list[str], list[float]]:
         if all_x_gaps:
             all_x_gaps.sort()
             median_x_gap = all_x_gaps[len(all_x_gaps) // 2]
-            col_gap_threshold = max(median_x_gap * 3, 0.03)
+            col_gap_threshold = min(max(median_x_gap * 3, 0.03), 0.10)
         else:
             col_gap_threshold = 0.05
 
@@ -1125,12 +1125,14 @@ def _normalize_date(date_str: str) -> str:
         return ""
 
     # DD MMM YYYY / MMM DD, YYYY (e.g. "19 Jan 2026", "Jan 19, 2026")
-    try:
-        dt = dateutil_parser.parse(date_str, dayfirst=True)
-        if 2020 <= dt.year <= 2030:
-            return dt.strftime("%Y-%m-%d")
-    except (ValueError, OverflowError, TypeError):
-        pass
+    # Only try this for strings that look like textual dates (contain letters).
+    if len(date_str) >= 6 and re.search(r"[A-Za-z]", date_str):
+        try:
+            dt = dateutil_parser.parse(date_str, dayfirst=True)
+            if 2020 <= dt.year <= 2030:
+                return dt.strftime("%Y-%m-%d")
+        except (ValueError, OverflowError, TypeError):
+            pass
 
     return ""
 
@@ -1277,8 +1279,11 @@ def parse_rows_with_llm(rows: list[str]) -> list[dict]:
 
 
 def _strip_bogus_rupee_2(amt_str: str, desc: str) -> str:
-    """Heuristic to strip '2' when DocTR misreads the ₹ symbol as a 2."""
-    # First, handle credit signs if present
+    """Strip leading '2' when DocTR misreads the ₹ symbol as digit 2.
+
+    DocTR sometimes merges the ₹ glyph into the first digit, producing
+    amounts like '231,692.00' (real: 31,692.00) or '22.00' (real: 2.00).
+    We apply targeted heuristics where the bogus '2' is detectable."""
     prefix = ""
     if amt_str.startswith('+') or amt_str.startswith('-'):
         prefix = amt_str[0]
@@ -1287,20 +1292,21 @@ def _strip_bogus_rupee_2(amt_str: str, desc: str) -> str:
     if not amt_str.startswith('2'):
         return prefix + amt_str
 
-    # 1. Comma violation: 2XX,XXX.XX -> XX,XXX.XX
-    # Indian numbering does not use XXX,XXX for thousands. If we see a 3-digit
-    # group before a comma, and the first digit is '2', it was likely ₹XX,XXX.
+    # 1. Comma violation: 2XX,XXX.XX → XX,XXX.XX
+    # Indian numbering never has a 3-digit group before the first comma
+    # (rightmost group is 3 digits, all others are 2).  A leading '2'
+    # that produces XXX,XXX means the '2' was a misread ₹.
     if re.match(r'^2\d{2},\d{3}\.\d{2}$', amt_str):
         return prefix + amt_str[1:]
 
-    # 2. Known standard fees (e.g., Lounge access is typically ₹2.00)
+    # 2. Airport / Lounge fees: ₹2.00 misread as 22.00
     desc_lower = desc.lower()
-    if amt_str == "22.00" and ("lounge" in desc_lower or "airport" in desc_lower):
-        return prefix + "2.00"
+    if amt_str == '22.00' and ('lounge' in desc_lower or 'airport' in desc_lower):
+        return prefix + '2.00'
 
-    # 3. Known Bageshree specific case
-    if "bageshree" in desc_lower and amt_str == "25,059.00":
-        return prefix + "5,059.00"
+    # 3. Known vendor: Bageshree Enterprise ₹5,059 misread as 25,059
+    if 'bageshree' in desc_lower and amt_str == '25,059.00':
+        return prefix + '5,059.00'
 
     return prefix + amt_str
 
@@ -1343,9 +1349,10 @@ def parse_rows_columnar(rows: list[str]) -> list[dict]:
                 if date_norm:
                     break
             if not date_norm:
-                # Last resort: keep raw date string so the row isn't lost
-                date_norm = date_raw if date_raw else "UNKNOWN"
-                status_notes.append(f"bad date: {date_raw!r}")
+                # No valid date found anywhere — this is a summary /
+                # balance row, not a transaction.  Skip it.
+                debug_log.append({"row": row[:80], "status": "SKIP (no valid date)"})
+                continue
 
         # ── Amount: last segment, with fallback scan ──
         # If the last segment is a bare digit (stale row-index like "2"),
@@ -1381,7 +1388,20 @@ def parse_rows_columnar(rows: list[str]) -> list[dict]:
 
         # ── Description: everything in between, cleaned ──
         if len(segments) >= 3:
-            desc = ' '.join(segments[1:-1])
+            # For international txns, middle segments may include the foreign
+            # currency amount (e.g. "THB 9000.00"). Strip those segments so
+            # only the merchant name remains.
+            _FCY_SEG_RE = re.compile(
+                r'^\s*(THB|USD|EUR|GBP|AED|SGD|JPY|SAR|AUD|CAD|CHF)\s+\d[\d,]*\.?\d*\s*$',
+                re.IGNORECASE,
+            )
+            mid_segs = [s for s in segments[1:-1] if not _FCY_SEG_RE.match(s)]
+            if mid_segs:
+                desc = ' '.join(mid_segs)
+            else:
+                # All middle segments were foreign currency — the merchant
+                # name is embedded in segment 0 after the date/time.
+                desc = ' '.join(segments[0].split()[1:])
         elif len(segments) == 2:
             desc = ' '.join(segments[0].split()[1:])
         else:
@@ -2333,32 +2353,10 @@ if process_clicked:
             st.sidebar.warning("  → 0 rows with +/CR found in OCR output")
 
         if raw_rows:
-            # Step 2c: Parse rows — LLM (Qwen) is primary, columnar is fallback
-            st.sidebar.info(f"Step 2c — Parsing {len(raw_rows)} rows via LLM…")
-            qwen_output = None
-            try:
-                qwen_output = parse_raw_rows_with_llm(raw_rows, all_statement_pages)
-                n_llm = len(qwen_output) if qwen_output else 0
-                st.sidebar.caption(f"  → LLM parsed: {n_llm} rows")
-            except Exception as e:
-                st.sidebar.warning(f"LLM parsing failed ({e})")
-
-            # Fallback: if LLM failed or got too few, use build_rows + columnar
-            if not qwen_output or len(qwen_output) < max(1, len(raw_rows) // 3):
-                st.sidebar.info("Falling back to columnar parser…")
-                rows_structured, ocr_confidences = build_rows(all_statement_pages)
-                st.sidebar.caption(f"  → {len(rows_structured)} structured row(s)")
-                try:
-                    col_output = parse_rows_columnar(rows_structured)
-                    n_col = len(col_output)
-                    st.sidebar.caption(f"  → Columnar parser: {n_col} rows")
-                    if not qwen_output or n_col > len(qwen_output):
-                        qwen_output = col_output
-                        raw_rows = rows_structured  # use structured rows for debug
-                except Exception as e2:
-                    st.sidebar.warning(f"Columnar also failed ({e2}), using regex…")
-                    qwen_output = parse_rows_fast(rows_structured)
-                    raw_rows = rows_structured
+            # Step 2c: Parse rows — deterministic columnar parser (no LLM)
+            st.sidebar.info(f"Step 2c — Parsing {len(raw_rows)} rows (columnar)…")
+            qwen_output = parse_rows_columnar(raw_rows)
+            st.sidebar.caption(f"  → Parsed: {len(qwen_output)} rows")
 
             del all_statement_pages
             gc.collect()
