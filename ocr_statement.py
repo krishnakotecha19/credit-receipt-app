@@ -9,7 +9,7 @@ Prints JSON to stdout: list of page dicts with keys:
 Credit detection uses Geometric Welding: for each amount token, a narrow
 pixel strip immediately to its left is probed for non-background marks
 (the '+' sign that DocTR fails to recognise as text).  This approach is
-hardware-agnostic — works on color, greyscale, and messy scans.
+hardware-agnostic — works on color, greyscale, and messy scanssssssssssss.
 """
 import os
 import sys
