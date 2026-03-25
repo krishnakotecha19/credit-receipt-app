@@ -21,6 +21,9 @@ import numpy as np
 os.environ["KMP_DUPLICATE_LIB_OK"] = "TRUE"
 os.environ["OMP_NUM_THREADS"] = "1"
 
+_OCR_STMT_VERSION = "v6-trailR-credit"
+print(f"[ocr_statement] Loaded {_OCR_STMT_VERSION}", file=sys.stderr, flush=True)
+
 # Matches amount-like tokens: 1,234.56  +450.00  -1,234.56  etc.
 # Leading +/- is optional so DocTR-merged tokens like "+7,627.00" are recognised.
 _AMT_RE = re.compile(r"^[+\-]?\d[\d,]*\.\d{2}$")
