@@ -30,9 +30,9 @@ _AMT_RE = re.compile(r"^[+\-]?\d[\d,]*\.\d{2}$")
 #   "3,598.26R" → "3,598.26"  (trailing credit marker 'R')
 _TRAIL_CLEANUP = re.compile(r'^([+\-]?\d[\d,]*\.\d{2})(\d{1,3}|[Rr])$')
 
-# Cleans up dates where DocTR merges the trailing row-index digit:
-#   "25/02/20261" → "25/02/2026"
-_DATE_TRAIL_CLEANUP = re.compile(r'^(\d{2}[/\-]\d{2}[/\-]\d{2,4})\d{1,3}$')
+# Cleans up dates where DocTR merges the trailing row-index digit or table border:
+#   "25/02/20261" → "25/02/2026", "25/02/2026]" → "25/02/2026"
+_DATE_TRAIL_CLEANUP = re.compile(r'^(\d{2}[/\-]\d{2}[/\-]\d{2,4})[\d\]Il|]{1,3}$')
 
 # ---------------------------------------------------------------------------
 # DocTR engine (one-time init per process)
@@ -160,6 +160,15 @@ def process_statement_pdf(pdf_path: str, poppler_path: str = None) -> list[dict]
                             # "R" = credit indicator on this statement; we will
                             # propagate this as has_plus_prefix below.
                             pass  # handled after plus_prefix logic below
+
+                    # --- Strip OCR artifacts for ₹ symbol prepended to amounts ---
+                    # DocTR frequently reads the '₹' symbol as 'R', '?', or literally '₹'.
+                    # This happens right before the numeric amount. If we leave it, the LLM
+                    # or downstream regex might misparse it.
+                    # Note: We cannot safely strip '2' because it's ambiguous with real amounts.
+                    _PREFIX_CLEANUP = re.compile(r'^[R\?₹]+')
+                    if re.match(r'^[R\?₹]+[+\-]?\d[\d,]*\.\d{2}$', raw_text):
+                        raw_text = _PREFIX_CLEANUP.sub('', raw_text)
 
                     # --- Credit detection ---
                     # Strategy 1: DocTR includes '+' directly in the token value
