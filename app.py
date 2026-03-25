@@ -527,7 +527,7 @@ def build_rows(ocr_pages: list[dict]) -> tuple[list[str], list[float]]:
                     # 2) standalone '+' token in this column
                     if any(w["text"].strip() == "+" for w in col_words):
                         is_credit = True
-                    # 3) '+' token in the column just before amount
+                    # 3) '+' or 'R'/'Cr' token in the column just before amount
                     if ci > 0:
                         prev_col_text = " ".join(w["text"] for w in columns[ci - 1]).strip()
                         if prev_col_text == "+":
@@ -535,6 +535,15 @@ def build_rows(ocr_pages: list[dict]) -> tuple[list[str], list[float]]:
                             # Don't include the standalone '+' column in output
                             if col_texts and col_texts[-1].strip() == "+":
                                 col_texts.pop()
+                        if prev_col_text.upper() in ("R", "CR"):
+                            is_credit = True
+                            if col_texts and col_texts[-1].strip().upper() in ("R", "CR"):
+                                col_texts.pop()
+                    # 4) 'R'/'Cr' token in the column just AFTER amount
+                    if ci + 1 < len(columns):
+                        next_col_text = " ".join(w["text"] for w in columns[ci + 1]).strip()
+                        if next_col_text.upper() in ("R", "CR"):
+                            is_credit = True
 
                     # Build amount text: strip standalone +/- from words,
                     # keep only the numeric part
@@ -547,6 +556,12 @@ def build_rows(ocr_pages: list[dict]) -> tuple[list[str], list[float]]:
                             t = t[1:]  # strip the sign
                         if t in ("+", "-"):
                             continue  # consumed for credit detection
+                        # 5) Standalone 'R' / 'Cr' / 'CR' credit marker —
+                        # DocTR often outputs the credit indicator as a
+                        # separate word next to the amount, not merged.
+                        if t.upper() in ("R", "CR"):
+                            is_credit = True
+                            continue  # consume, don't include in amount text
                         # Skip standalone small digits (row-index artifacts like "2", "12")
                         # that DocTR places in/near the amount column
                         if re.fullmatch(r"\d{1,3}", t):
@@ -840,6 +855,10 @@ def build_raw_text_rows(ocr_pages: list[dict]) -> tuple[list[str], list[float]]:
                             is_credit = True
                             t = t[1:]
                         if t in ("+", "-"):
+                            continue
+                        # Standalone 'R' / 'Cr' / 'CR' credit marker
+                        if t.upper() in ("R", "CR"):
+                            is_credit = True
                             continue
                         if re.fullmatch(r"\d{1,3}", t):
                             continue  # stale row-index artifact
