@@ -1,7 +1,7 @@
 """Subprocess worker: PaddleOCR-based receipt extraction.
 
 Usage:
-    python ocr_receipt.py <image_path>
+    python ocr_receipt.py <image_path><xyz>
 
 Prints JSON to stdout with keys:
     receipt_file, vendor, amount, date, raw_text, confidence, status
