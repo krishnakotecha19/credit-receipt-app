@@ -3204,7 +3204,7 @@ HTML_TEMPLATE = """
                         stageBtn.style.cssText = "font-size:.75rem;padding:4px 12px;background:linear-gradient(135deg,#10b981,#059669);color:#fff;border:none;border-radius:4px;cursor:pointer;font-weight:600;";
                         stageBtn.addEventListener("click", function() { _stageFromSP(entity, b.id, "receipt_batch", stageBtn, b.name); });
                         brow.appendChild(bname);
-                        brow.appendChild(ocrBtn);
+                        brow.appendChild(stageBtn);
                         batchBox.appendChild(brow);
                     })(meta.receipt_batches[j]);
                 }
