@@ -414,6 +414,73 @@ class SharePointManager:
             logger.error(f"[{self.entity}] Sync metadata error: {exc}")
             return {"statements": [], "receipt_batches": []}
 
+    def get_file_content(self, item_id: str) -> dict:
+        """Download a file's content as bytes directly into memory.
+
+        Returns
+        -------
+        dict — {"ok": True, "name": filename, "bytes": raw_bytes}
+               or {"ok": False, "error": msg}
+        """
+        lib = self._get_library()
+        if lib is None:
+            return {"ok": False, "error": "Library not found"}
+
+        try:
+            item = lib.get_item(item_id)
+            if item is None:
+                return {"ok": False, "error": f"Item '{item_id}' not found"}
+            if item.is_folder:
+                return {"ok": False, "error": "Item is a folder, not a file"}
+
+            from io import BytesIO
+            buf = BytesIO()
+            item.download(output=buf)
+            buf.seek(0)
+            return {
+                "ok": True,
+                "name": item.name,
+                "bytes": buf.read(),
+            }
+        except Exception as exc:
+            logger.error(f"[{self.entity}] get_file_content error: {exc}")
+            return {"ok": False, "error": str(exc)}
+
+    def get_folder_files(self, folder_id: str) -> dict:
+        """Get all image files in a folder as bytes.
+
+        Returns
+        -------
+        dict — {"ok": True, "files": [{"name": ..., "bytes": ...}, ...]}
+               or {"ok": False, "error": msg}
+        """
+        lib = self._get_library()
+        if lib is None:
+            return {"ok": False, "error": "Library not found"}
+
+        try:
+            folder = lib.get_item(folder_id)
+            if folder is None or not folder.is_folder:
+                return {"ok": False, "error": "Folder not found"}
+
+            from io import BytesIO
+            files = []
+            for item in folder.get_items():
+                if item.is_folder:
+                    continue
+                ext = item.name.lower().rsplit(".", 1)[-1] if "." in item.name else ""
+                if ext not in ("png", "jpg", "jpeg"):
+                    continue
+                buf = BytesIO()
+                item.download(output=buf)
+                buf.seek(0)
+                files.append({"name": item.name, "bytes": buf.read()})
+
+            return {"ok": True, "files": files}
+        except Exception as exc:
+            logger.error(f"[{self.entity}] get_folder_files error: {exc}")
+            return {"ok": False, "error": str(exc)}
+
     def stage_files(self, statement_id: str, batch_folder_id: str, base_staging_dir: str = "static/staging") -> dict:
         """Download selected Statement PDF and all images in the selected Receipt batch.
         Skips download if local file exists and ETag matches.

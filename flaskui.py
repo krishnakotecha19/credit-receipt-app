@@ -12,7 +12,7 @@ from dotenv import load_dotenv
 load_dotenv(override=True)
 
 from sharepoint_manager import SharePointManager
-import os, re, gc, json, subprocess, sys, threading, time
+import os, re, gc, json, subprocess, sys, threading, time, tempfile
 import pandas as pd
 import requests
 from pathlib import Path
@@ -2218,10 +2218,50 @@ HTML_TEMPLATE = """
             <button type="button" class="tab-btn" data-tab="debug">
                 <i class="bi bi-bug"></i> Debug
             </button>
-            <button type="button" class="tab-btn" data-tab="sync" id="btnSyncSP" style="margin-left:auto; background:linear-gradient(135deg,#06B6D4,#3B82F6); color:#fff; border-radius:var(--radius-sm); font-weight:600; padding:8px 20px; border:none; cursor:pointer; font-size:0.85rem;">
+        </div>
+        <div style="display:flex; align-items:center; justify-content:flex-end; margin:-1rem 0 1rem 0;">
+            <button type="button" id="btnSyncSP" style="background:linear-gradient(135deg,#0ea5e9,#6366f1);color:#fff;border:none;border-radius:8px;padding:8px 18px;font-size:0.85rem;font-weight:600;cursor:pointer;display:flex;align-items:center;gap:6px;transition:opacity 0.2s;" onmouseover="this.style.opacity='.85'" onmouseout="this.style.opacity='1'">
                 <i class="bi bi-cloud-arrow-down"></i> Sync SharePoint
             </button>
         </div>
+
+        <!-- SharePoint Sync Panel — replaces tab content when open -->
+        <div id="spSyncPanel" style="display:none;">
+            <div class="data-card">
+                <div class="card-header">
+                    <h5><i class="bi bi-cloud-arrow-down" style="color:var(--accent)"></i> SharePoint Browser — <span id="syncEntityLabel">{{ entity }}</span></h5>
+                    <div style="display:flex;gap:8px;align-items:center;">
+                        <button type="button" class="btn btn-sm btn-outline-primary" id="btnRefreshSync">
+                            <i class="bi bi-arrow-clockwise"></i> Refresh
+                        </button>
+                        <button type="button" class="btn btn-sm btn-outline-secondary" id="btnCloseSync">
+                            <i class="bi bi-x"></i> Close
+                        </button>
+                    </div>
+                </div>
+                <div class="card-body padded">
+                    <div id="syncPlaceholder" style="text-align:center;padding:2rem;">
+                        <i class="bi bi-cloud" style="font-size:2.5rem;color:var(--accent);display:block;margin-bottom:.5rem;"></i>
+                        <p style="color:var(--text-muted);font-size:.85rem;">Connecting to SharePoint...</p>
+                    </div>
+                    <div id="syncResults" style="display:none;">
+                        <div style="display:grid;grid-template-columns:1fr 1fr;gap:1.5rem;">
+                            <div>
+                                <h6 style="font-size:.8rem;font-weight:700;text-transform:uppercase;letter-spacing:.06em;color:var(--text-muted);margin-bottom:.75rem;"><i class="bi bi-file-earmark-pdf"></i> Inbound Statements</h6>
+                                <div id="syncStatements" style="display:flex;flex-direction:column;gap:6px;"></div>
+                            </div>
+                            <div>
+                                <h6 style="font-size:.8rem;font-weight:700;text-transform:uppercase;letter-spacing:.06em;color:var(--text-muted);margin-bottom:.75rem;"><i class="bi bi-folder"></i> Inbound Receipt Batches</h6>
+                                <div id="syncBatches" style="display:flex;flex-direction:column;gap:6px;"></div>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+            </div>
+        </div>
+
+        <!-- All tab panels wrapped in a container for show/hide -->
+        <div id="tabPanelsContainer">
 
         <!-- Tab: Auto-Approved -->
         <div class="tab-panel active" id="tab-approved">
@@ -2749,43 +2789,12 @@ HTML_TEMPLATE = """
 
         </div>
 
-        <!-- Tab: Sync SharePoint -->
-        <div class="tab-panel" id="tab-sync">
-            <div class="data-card">
-                <div class="card-header">
-                    <h5><i class="bi bi-cloud-arrow-down" style="color:var(--accent)"></i> SharePoint Browser — <span id="syncEntityLabel">{{ entity }}</span></h5>
-                    <button type="button" class="btn btn-sm btn-outline-primary" id="btnRefreshSync" onclick="loadSyncData()">
-                        <i class="bi bi-arrow-clockwise"></i> Refresh
-                    </button>
-                </div>
-                <div class="card-body padded" id="syncContent">
-                    <div class="empty-state" id="syncPlaceholder">
-                        <i class="bi bi-cloud" style="font-size:2.5rem;color:var(--accent);display:block;margin-bottom:.5rem;"></i>
-                        <p style="color:var(--text-muted);font-size:.85rem;">Click <strong>Refresh</strong> to load files from SharePoint.</p>
-                    </div>
-                    <div id="syncResults" style="display:none;">
-                        <div style="display:grid;grid-template-columns:1fr 1fr;gap:1.5rem;">
-                            <!-- Statements column -->
-                            <div>
-                                <h6 style="font-size:.8rem;font-weight:700;text-transform:uppercase;letter-spacing:.06em;color:var(--text-muted);margin-bottom:.75rem;"><i class="bi bi-file-earmark-pdf"></i> Inbound Statements</h6>
-                                <div id="syncStatements" style="display:flex;flex-direction:column;gap:6px;"></div>
-                            </div>
-                            <!-- Receipt Batches column -->
-                            <div>
-                                <h6 style="font-size:.8rem;font-weight:700;text-transform:uppercase;letter-spacing:.06em;color:var(--text-muted);margin-bottom:.75rem;"><i class="bi bi-folder"></i> Inbound Receipt Batches</h6>
-                                <div id="syncBatches" style="display:flex;flex-direction:column;gap:6px;"></div>
-                            </div>
-                        </div>
-                    </div>
-                </div>
-            </div>
-        </div>
-
+        </div><!-- /tabPanelsContainer -->
 
     </main>
 </div>
 
-<!-- Receipt Image Modal Overlay -->
+<!-- SharePoint sync JS moved to end of page -->
 <div class="receipt-modal-overlay" id="receiptModal" onclick="this.classList.remove('active')">
     <img id="receiptModalImg" src="" alt="Receipt Preview">
 </div>
@@ -2793,149 +2802,24 @@ HTML_TEMPLATE = """
 <script>
     // Receipt image modal
     function showReceiptModal(src) {
-        const modal = document.getElementById('receiptModal');
+        var modal = document.getElementById('receiptModal');
         document.getElementById('receiptModalImg').src = src;
         modal.classList.add('active');
     }
 
     // Tab switching
-    document.querySelectorAll('.tab-btn').forEach(btn => {
-        btn.addEventListener('click', () => {
-            try {
-                document.querySelectorAll('.tab-btn').forEach(b => b.classList.remove('active'));
-                document.querySelectorAll('.tab-panel').forEach(p => p.classList.remove('active'));
-                btn.classList.add('active');
-                document.getElementById('tab-' + btn.dataset.tab).classList.add('active');
-                
-                // Auto-load sync data when Sync tab is first clicked
-                if (btn.dataset.tab === 'sync' && !window._syncLoaded) {
-                    loadSyncData();
-                }
-            } catch (err) {
-                alert('Tab switch error: ' + err.message);
-                console.error(err);
-            }
+    document.querySelectorAll('.tab-btn').forEach(function(btn) {
+        btn.addEventListener('click', function() {
+            document.querySelectorAll('.tab-btn').forEach(function(b) { b.classList.remove('active'); });
+            document.querySelectorAll('.tab-panel').forEach(function(p) { p.classList.remove('active'); });
+            btn.classList.add('active');
+            var panel = document.getElementById('tab-' + btn.dataset.tab);
+            if (panel) panel.classList.add('active');
         });
     });
 
-    // SharePoint Sync — load metadata
-    function loadSyncData() {
-        try {
-            const entitySelect = document.querySelector('select[name="entity"]');
-            if (!entitySelect) throw new Error("Entity dropdown not found");
-            const entity = entitySelect.value.toLowerCase();
-            
-            const label = document.getElementById('syncEntityLabel');
-            if (label) label.textContent = entity.charAt(0).toUpperCase() + entity.slice(1);
-            
-            const btn = document.getElementById('btnRefreshSync');
-            if (btn) {
-                btn.disabled = true;
-                btn.innerHTML = '<i class="bi bi-arrow-clockwise spin"></i> Loading...';
-            }
-            
-            const msgObj = document.getElementById('syncPlaceholder');
-            const resObj = document.getElementById('syncResults');
-            if (msgObj) {
-                msgObj.style.display = 'block';
-                msgObj.innerHTML = '<div style="text-align:center; padding: 2rem;"><div class="spinner-border text-primary" role="status" style="width: 3rem; height: 3rem;"></div><p style="margin-top:1rem; color:var(--text-muted); font-weight:500;">Connecting to SharePoint...</p></div>';
-            }
-            if (resObj) resObj.style.display = 'none';
-
-            fetch('/api/sync/' + encodeURIComponent(entity), {
-            method: 'POST',
-            headers: {'Content-Type': 'application/json'},
-            body: JSON.stringify({})
-        })
-        .then(r => r.json())
-        .then(data => {
-            btn.disabled = false;
-            btn.innerHTML = '<i class="bi bi-arrow-clockwise"></i> Refresh';
-            if (!data.ok) {
-                document.getElementById('syncPlaceholder').style.display = 'block';
-                document.getElementById('syncPlaceholder').innerHTML =
-                    '<i class="bi bi-exclamation-triangle" style="font-size:2rem;color:var(--warning);display:block;margin-bottom:.5rem;"></i>' +
-                    '<p style="color:var(--danger);font-size:.85rem;">' + (data.error || 'Sync failed') + '</p>';
-                return;
-            }
-            window._syncLoaded = true;
-            const meta = data.metadata;
-            const stmtBox = document.getElementById('syncStatements');
-            const batchBox = document.getElementById('syncBatches');
-            stmtBox.innerHTML = '';
-            batchBox.innerHTML = '';
-
-            if (meta.statements.length === 0) {
-                stmtBox.innerHTML = '<p style="color:var(--text-muted);font-size:.82rem;">No PDF statements found.</p>';
-            } else {
-                meta.statements.forEach(s => {
-                    const sizeKB = s.size ? (s.size / 1024).toFixed(1) + ' KB' : '';
-                    stmtBox.innerHTML +=
-                        '<div style="display:flex;align-items:center;gap:10px;padding:8px 12px;border:1px solid var(--border);border-radius:var(--radius-sm);background:var(--surface-alt);font-size:.82rem;">' +
-                        '<i class="bi bi-file-earmark-pdf" style="font-size:1.2rem;color:#EF4444;"></i>' +
-                        '<div style="flex:1;"><strong>' + s.name + '</strong>' +
-                        (sizeKB ? '<span style="color:var(--text-muted);margin-left:8px;">' + sizeKB + '</span>' : '') +
-                        '</div>' +
-                        '<button class="btn btn-sm btn-outline-primary" onclick="stageFile(\'' + entity + '\',\'' + s.id + '\',null)" style="font-size:.75rem;padding:2px 10px;"><i class="bi bi-download"></i> Stage</button>' +
-                        '</div>';
-                });
-            }
-
-            if (meta.receipt_batches.length === 0) {
-                batchBox.innerHTML = '<p style="color:var(--text-muted);font-size:.82rem;">No receipt batches found.</p>';
-            } else {
-                meta.receipt_batches.forEach(b => {
-                    batchBox.innerHTML +=
-                        '<div style="display:flex;align-items:center;gap:10px;padding:8px 12px;border:1px solid var(--border);border-radius:var(--radius-sm);background:var(--surface-alt);font-size:.82rem;">' +
-                        '<i class="bi bi-folder-fill" style="font-size:1.2rem;color:var(--warning);"></i>' +
-                        '<div style="flex:1;"><strong>' + b.name + '</strong></div>' +
-                        '<button class="btn btn-sm btn-outline-primary" onclick="stageFile(\'' + entity + '\',null,\'' + b.id + '\')" style="font-size:.75rem;padding:2px 10px;"><i class="bi bi-download"></i> Stage</button>' +
-                        '</div>';
-                });
-            }
-            document.getElementById('syncResults').style.display = 'block';
-        })
-        .catch(err => {
-            if (btn) {
-                btn.disabled = false;
-                btn.innerHTML = '<i class="bi bi-arrow-clockwise"></i> Refresh';
-            }
-            if (msgObj) {
-                msgObj.style.display = 'block';
-                msgObj.innerHTML =
-                    '<p style="color:var(--danger);font-size:.85rem;">Network error: ' + err + '</p>';
-            }
-        });
-        } catch (err) {
-            alert('loadSyncData error: ' + err.message);
-            console.error(err);
-        }
-    }
-
-    // Stage individual statement or batch
-    function stageFile(entity, stmtId, batchId) {
-        const payload = {};
-        if (stmtId) payload.statement_id = stmtId;
-        if (batchId) payload.batch_folder_id = batchId;
-        fetch('/api/sync/' + encodeURIComponent(entity), {
-            method: 'POST',
-            headers: {'Content-Type': 'application/json'},
-            body: JSON.stringify(payload)
-        })
-        .then(r => r.json())
-        .then(data => {
-            if (data.ok) {
-                alert('Staged successfully!\\n' +
-                    (data.statement ? 'Statement: ' + data.statement + '\\n' : '') +
-                    (data.receipts && data.receipts.length ? 'Receipts: ' + data.receipts.length + ' files' : ''));
-            } else {
-                alert('Staging failed: ' + (data.error || 'Unknown error'));
-            }
-        })
-        .catch(err => alert('Network error: ' + err));
-    }
-
     // File upload feedback
+
     document.getElementById('receiptInput').addEventListener('change', function() {
         const n = this.files.length;
         if (n > 0) {
@@ -3113,6 +2997,210 @@ HTML_TEMPLATE = """
 </script>
 
 <script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/js/bootstrap.bundle.min.js"></script>
+
+<script>
+(function() {
+    var syncBtn = document.getElementById("btnSyncSP");
+    var tabContainer = document.getElementById("tabPanelsContainer");
+    var navTabs = document.querySelector(".nav-tabs-custom");
+
+    function _openSync() {
+        var syncDiv = document.getElementById("spSyncPanel");
+        if (!syncDiv) return;
+        syncDiv.style.display = "block";
+        if (tabContainer) tabContainer.style.display = "none";
+        if (navTabs) navTabs.style.display = "none";
+        _doLoadSync();
+    }
+
+    function _closeSync() {
+        var syncDiv = document.getElementById("spSyncPanel");
+        if (syncDiv) syncDiv.style.display = "none";
+        if (tabContainer) tabContainer.style.display = "";
+        if (navTabs) navTabs.style.display = "";
+    }
+
+    if (syncBtn) {
+        syncBtn.addEventListener("click", function() {
+            var syncDiv = document.getElementById("spSyncPanel");
+            if (syncDiv && syncDiv.style.display === "block") {
+                _closeSync();
+            } else {
+                _openSync();
+            }
+        });
+    }
+
+    var closeBtn = document.getElementById("btnCloseSync");
+    if (closeBtn) {
+        closeBtn.addEventListener("click", function() { _closeSync(); });
+    }
+
+    var refreshBtn = document.getElementById("btnRefreshSync");
+    if (refreshBtn) {
+        refreshBtn.addEventListener("click", function() { _doLoadSync(); });
+    }
+
+    function _doLoadSync() {
+        var entitySelect = document.querySelector("select[name=entity]");
+        if (!entitySelect) { alert("Entity dropdown not found"); return; }
+        var entity = entitySelect.value.toLowerCase();
+
+        var label    = document.getElementById("syncEntityLabel");
+        var btn      = document.getElementById("btnRefreshSync");
+        var msgObj   = document.getElementById("syncPlaceholder");
+        var resObj   = document.getElementById("syncResults");
+        var stmtBox  = document.getElementById("syncStatements");
+        var batchBox = document.getElementById("syncBatches");
+
+        if (label) label.textContent = entity.charAt(0).toUpperCase() + entity.slice(1);
+        if (btn) { btn.disabled = true; btn.textContent = "Loading..."; }
+        if (resObj) resObj.style.display = "none";
+        if (msgObj) { msgObj.style.display = "block"; msgObj.textContent = "Connecting to SharePoint..."; }
+
+        fetch("/api/sync/" + encodeURIComponent(entity), {
+            method: "POST",
+            headers: {"Content-Type": "application/json"},
+            body: JSON.stringify({})
+        })
+        .then(function(r) { return r.json(); })
+        .then(function(data) {
+            if (btn) { btn.disabled = false; btn.textContent = "Refresh"; }
+            if (!data.ok) {
+                if (msgObj) { msgObj.style.display = "block"; msgObj.textContent = data.error || "Sync failed"; }
+                return;
+            }
+            if (stmtBox) stmtBox.innerHTML = "";
+            if (batchBox) batchBox.innerHTML = "";
+            var meta = data.metadata;
+
+            if (!meta.statements || meta.statements.length === 0) {
+                if (stmtBox) stmtBox.textContent = "No PDF statements found.";
+            } else {
+                for (var i = 0; i < meta.statements.length; i++) {
+                    (function(s) {
+                        var sizeKB = s.size ? (s.size / 1024).toFixed(1) + " KB" : "";
+                        var row = document.createElement("div");
+                        row.style.cssText = "display:flex;align-items:center;gap:10px;padding:8px 12px;border:1px solid rgba(255,255,255,0.1);border-radius:8px;background:rgba(0,0,0,0.15);font-size:.82rem;margin-bottom:6px;";
+                        var nameEl = document.createElement("strong");
+                        nameEl.textContent = s.name + (sizeKB ? " (" + sizeKB + ")" : "");
+                        nameEl.style.flex = "1";
+                        var ocrBtn = document.createElement("button");
+                        ocrBtn.textContent = "Run OCR";
+                        ocrBtn.style.cssText = "font-size:.75rem;padding:4px 12px;background:linear-gradient(135deg,#10b981,#059669);color:#fff;border:none;border-radius:4px;cursor:pointer;font-weight:600;";
+                        ocrBtn.addEventListener("click", function() { _runOCR(entity, s.id, "statement", ocrBtn); });
+                        row.appendChild(nameEl);
+                        row.appendChild(ocrBtn);
+                        stmtBox.appendChild(row);
+                    })(meta.statements[i]);
+                }
+            }
+
+            if (!meta.receipt_batches || meta.receipt_batches.length === 0) {
+                if (batchBox) batchBox.textContent = "No receipt batches found.";
+            } else {
+                for (var j = 0; j < meta.receipt_batches.length; j++) {
+                    (function(b) {
+                        var brow = document.createElement("div");
+                        brow.style.cssText = "display:flex;align-items:center;gap:10px;padding:8px 12px;border:1px solid rgba(255,255,255,0.1);border-radius:8px;background:rgba(0,0,0,0.15);font-size:.82rem;margin-bottom:6px;";
+                        var bname = document.createElement("strong");
+                        bname.textContent = b.name;
+                        bname.style.flex = "1";
+                        var ocrBtn = document.createElement("button");
+                        ocrBtn.textContent = "Run OCR";
+                        ocrBtn.style.cssText = "font-size:.75rem;padding:4px 12px;background:linear-gradient(135deg,#10b981,#059669);color:#fff;border:none;border-radius:4px;cursor:pointer;font-weight:600;";
+                        ocrBtn.addEventListener("click", function() { _runOCR(entity, b.id, "receipt_batch", ocrBtn); });
+                        brow.appendChild(bname);
+                        brow.appendChild(ocrBtn);
+                        batchBox.appendChild(brow);
+                    })(meta.receipt_batches[j]);
+                }
+            }
+
+            if (msgObj) msgObj.style.display = "none";
+            if (resObj) resObj.style.display = "block";
+        })
+        .catch(function(err) {
+            if (btn) { btn.disabled = false; btn.textContent = "Refresh"; }
+            if (msgObj) { msgObj.style.display = "block"; msgObj.textContent = "Error: " + err; }
+        });
+    }
+
+    function _runOCR(entity, id, type, btnEl) {
+        var origText = btnEl.textContent;
+        btnEl.disabled = true;
+        btnEl.textContent = "Downloading...";
+        btnEl.style.opacity = "0.6";
+
+        var payload = {type: type};
+        if (type === "receipt_batch") {
+            payload.folder_id = id;
+        } else {
+            payload.item_id = id;
+        }
+
+        fetch("/api/ocr/sharepoint/" + encodeURIComponent(entity), {
+            method: "POST",
+            headers: {"Content-Type": "application/json"},
+            body: JSON.stringify(payload)
+        })
+        .then(function(r) { return r.json(); })
+        .then(function(data) {
+            if (data.ok) {
+                if (data.status === "cached") {
+                    // Cached — reload immediately
+                    alert("Loaded from cache: " + (data.transactions || 0) + " transactions");
+                    location.reload();
+                    return;
+                }
+                // OCR started in background — close sync, show progress, poll
+                btnEl.textContent = "OCR Running...";
+                btnEl.style.background = "#f59e0b";
+                _closeSync();
+                // Show progress section and poll
+                var progSection = document.getElementById("progressSection");
+                if (progSection) progSection.style.display = "block";
+                _pollUntilDone();
+            } else {
+                btnEl.disabled = false;
+                btnEl.textContent = origText;
+                btnEl.style.opacity = "1";
+                alert("OCR failed: " + (data.error || "Unknown error"));
+            }
+        })
+        .catch(function(err) {
+            btnEl.disabled = false;
+            btnEl.textContent = origText;
+            btnEl.style.opacity = "1";
+            alert("Error: " + err);
+        });
+    }
+
+    function _pollUntilDone() {
+        fetch("/progress")
+            .then(function(r) { return r.json(); })
+            .then(function(data) {
+                // Update progress UI if elements exist
+                var stepEl = document.getElementById("stepName");
+                var pctEl = document.getElementById("stepPct");
+                var bar = document.getElementById("progressBar");
+                var detail = document.getElementById("progressDetail");
+                if (stepEl) stepEl.innerHTML = '<span class="detail-spinner"></span> ' + (data.step || "Processing...");
+                if (pctEl) pctEl.textContent = data.pct + "%";
+                if (bar) bar.style.width = data.pct + "%";
+                if (detail) detail.textContent = data.detail || "Working...";
+
+                if (data.processing) {
+                    setTimeout(_pollUntilDone, 1000);
+                } else {
+                    // Done — reload page to show results
+                    location.reload();
+                }
+            })
+            .catch(function() { setTimeout(_pollUntilDone, 2000); });
+    }
+})();
+</script>
 </body>
 </html>
 """
@@ -3180,7 +3268,7 @@ def index():
                 "stmt_date": row.get("Statement Date", ""),
                 "score": row.get("Match Score", 0),
                 "credit_card_bank": row.get("Credit Card Bank", ""),
-                "img_exists": img_path.exists(),
+                "img_exists": img_path.exists() if img_path else False,
             })
 
 
@@ -3458,6 +3546,232 @@ def api_sync_entity(entity):
         return jsonify({"ok": False, "error": str(e)}), 400
     except Exception as e:
         return jsonify({"ok": False, "error": str(e)}), 500
+
+
+@app.route("/api/ocr/sharepoint/<path:entity>", methods=["POST"])
+def api_ocr_sharepoint(entity):
+    """Download file from SharePoint, kick off OCR in background thread.
+
+    Returns immediately with {"ok": true, "status": "started"}.
+    The JS then polls /progress and reloads when done.
+    """
+    if _app_state.get("processing"):
+        return jsonify({"ok": False, "error": "Processing already in progress"}), 409
+
+    mapped = _ENTITY_SYNC_MAP.get(entity.strip().lower())
+    if not mapped:
+        return jsonify({"ok": False, "error": f"Unknown entity '{entity}'"}), 400
+
+    data = request.get_json(force=True, silent=True) or {}
+    item_type = data.get("type", "")
+    item_id = data.get("item_id", "")
+    folder_id = data.get("folder_id", "")
+
+    if not item_id and not folder_id:
+        return jsonify({"ok": False, "error": "item_id or folder_id required"}), 400
+
+    try:
+        sp = SharePointManager(entity=mapped)
+        if not sp.is_authenticated:
+            return jsonify({"ok": False, "error": "SharePoint authentication failed"}), 500
+
+        # Download bytes from SharePoint NOW (fast), then run OCR in background
+        if item_type == "statement" and item_id:
+            result = sp.get_file_content(item_id)
+            if not result["ok"]:
+                return jsonify(result), 500
+            # Check cache — return instantly if cached
+            cached_df = _load_stmt_cache(result["name"])
+            if cached_df is not None:
+                _app_state["df_statements"] = cached_df
+                _try_rematch()
+                _save_state()
+                return jsonify({"ok": True, "status": "cached",
+                                "transactions": len(cached_df)})
+            # Write to temp, launch background OCR
+            tmp = tempfile.NamedTemporaryFile(suffix=".pdf", delete=False)
+            tmp.write(result["bytes"])
+            tmp.close()
+            t = threading.Thread(
+                target=_bg_ocr_statement,
+                args=(tmp.name, result["name"]),
+                daemon=True,
+            )
+            t.start()
+            return jsonify({"ok": True, "status": "started",
+                            "filename": result["name"]})
+
+        elif item_type == "receipt_batch" and folder_id:
+            folder_result = sp.get_folder_files(folder_id)
+            if not folder_result["ok"]:
+                return jsonify(folder_result), 500
+            files = folder_result["files"]
+            if not files:
+                return jsonify({"ok": False, "error": "No image files in folder"})
+            # Write all to temp files
+            tmp_paths = []
+            name_map = {}
+            for f in files:
+                ext = f["name"].lower().rsplit(".", 1)[-1] if "." in f["name"] else "jpg"
+                tmp = tempfile.NamedTemporaryFile(suffix=f".{ext}", delete=False)
+                tmp.write(f["bytes"])
+                tmp.close()
+                tmp_paths.append(tmp.name)
+                name_map[tmp.name] = f["name"]
+            t = threading.Thread(
+                target=_bg_ocr_receipts,
+                args=(tmp_paths, name_map),
+                daemon=True,
+            )
+            t.start()
+            return jsonify({"ok": True, "status": "started",
+                            "count": len(files)})
+
+        else:
+            return jsonify({"ok": False, "error": f"Invalid type '{item_type}'"}), 400
+
+    except Exception as e:
+        return jsonify({"ok": False, "error": str(e)}), 500
+
+
+def _bg_ocr_statement(tmp_path, filename):
+    """Background thread: run statement OCR pipeline on a temp PDF."""
+    _app_state["processing"] = True
+    _app_state["log_lines"] = []
+
+    def log(msg):
+        _app_state["log_lines"].append(msg)
+
+    def set_progress(step, pct, detail=""):
+        _app_state["progress"] = {"step": step, "pct": pct, "detail": detail}
+
+    try:
+        set_progress("Statements", 5, f"Running OCR on {filename}...")
+        log(f"OCR on SharePoint file: {filename}")
+
+        pages = process_statement_pdf(tmp_path)
+        n_words = sum(len(p.get("raw_ocr_words", [])) for p in pages)
+        log(f"OCR done: {len(pages)} page(s), {n_words} words")
+
+        _app_state["debug_stmt_ocr_words"] = [
+            {"page": p["page_number"], "status": p.get("status", ""),
+             "words": p.get("raw_ocr_words", [])}
+            for p in pages
+        ]
+
+        set_progress("Statements", 36, "Building rows...")
+        raw_rows, confs = _build_raw_text_rows(pages)
+        _app_state["debug_stmt_raw_rows"] = raw_rows
+        log(f"Built {len(raw_rows)} raw row(s)")
+
+        if raw_rows:
+            set_progress("Statements", 50, "Parsing rows...")
+            parsed = _parse_rows_columnar(raw_rows)
+            log(f"Parsed {len(parsed)} transaction(s)")
+
+            set_progress("Statements", 65, "Validating...")
+            df_stmts = _validate_transactions(parsed, confs, raw_rows)
+            _app_state["df_statements"] = df_stmts
+            _save_stmt_cache(filename, df_stmts)
+            log(f"Validated {len(df_stmts)} transaction(s)")
+
+            set_progress("Matching", 80, "Matching...")
+            _try_rematch()
+        else:
+            log("No rows reconstructed from statement.")
+
+        set_progress("Done", 100, "Complete!")
+        log("Processing complete!")
+    except Exception as e:
+        log(f"ERROR: {e}")
+        set_progress("Done", 100, f"Error: {e}")
+    finally:
+        try:
+            os.unlink(tmp_path)
+        except OSError:
+            pass
+        gc.collect()
+        _save_state()
+        _app_state["processing"] = False
+
+
+def _bg_ocr_receipts(tmp_paths, name_map):
+    """Background thread: run receipt OCR on temp image files."""
+    _app_state["processing"] = True
+    _app_state["log_lines"] = []
+
+    def log(msg):
+        _app_state["log_lines"].append(msg)
+
+    def set_progress(step, pct, detail=""):
+        _app_state["progress"] = {"step": step, "pct": pct, "detail": detail}
+
+    try:
+        set_progress("Receipts", 5, f"Processing {len(tmp_paths)} receipt(s)...")
+        log(f"OCR on {len(tmp_paths)} receipt(s) from SharePoint")
+
+        def _cb(done, total):
+            local_pct = done / total
+            global_pct = max(5, int(5 + local_pct * 60))
+            set_progress("Receipts", global_pct, f"Receipt {done}/{total}")
+
+        results = extract_receipts_batch(tmp_paths, progress_callback=_cb)
+
+        # Fix receipt_file names to original SharePoint filenames
+        for r, tp in zip(results, tmp_paths):
+            r["receipt_file"] = name_map.get(tp, r.get("receipt_file", ""))
+
+        n_ok = sum(1 for r in results if r.get("status") == "success")
+        log(f"Receipts done: {n_ok} success, {len(results) - n_ok} failed")
+
+        # Store debug info
+        debug = _app_state.get("debug_receipt_ocr", {})
+        for d in results:
+            debug[d.get("receipt_file", "")] = {
+                "raw_text": d.get("raw_text", ""),
+                "vendor": d.get("vendor"),
+                "amount": d.get("amount"),
+                "date": d.get("date"),
+                "confidence": d.get("confidence", 0.0),
+                "status": d.get("status", "failed"),
+            }
+        _app_state["debug_receipt_ocr"] = debug
+
+        # Merge into existing receipts
+        df_new = pd.DataFrame(results)
+        existing = _app_state.get("df_receipts")
+        if existing is not None and not existing.empty:
+            df_new = pd.concat([existing, df_new]).drop_duplicates(
+                subset="receipt_file", keep="last"
+            ).reset_index(drop=True)
+        _app_state["df_receipts"] = df_new
+
+        set_progress("Matching", 75, "Matching...")
+        _try_rematch()
+
+        set_progress("Done", 100, f"{n_ok} receipts processed")
+        log("Processing complete!")
+    except Exception as e:
+        log(f"ERROR: {e}")
+        set_progress("Done", 100, f"Error: {e}")
+    finally:
+        for tp in tmp_paths:
+            try:
+                os.unlink(tp)
+            except OSError:
+                pass
+        gc.collect()
+        _save_state()
+        _app_state["processing"] = False
+
+
+def _try_rematch():
+    """Re-run matching if both receipts and statements exist in app state."""
+    df_r = _app_state.get("df_receipts")
+    df_s = _app_state.get("df_statements")
+    if df_r is not None and not df_r.empty and df_s is not None and not df_s.empty:
+        df_matches = _match_transactions(df_r, df_s)
+        _app_state["df_matches"] = df_matches
 
 
 @app.route("/clear")
