@@ -2789,28 +2789,45 @@ HTML_TEMPLATE = """
     // Tab switching
     document.querySelectorAll('.tab-btn').forEach(btn => {
         btn.addEventListener('click', () => {
-            document.querySelectorAll('.tab-btn').forEach(b => b.classList.remove('active'));
-            document.querySelectorAll('.tab-panel').forEach(p => p.classList.remove('active'));
-            btn.classList.add('active');
-            document.getElementById('tab-' + btn.dataset.tab).classList.add('active');
-            // Auto-load sync data when Sync tab is first clicked
-            if (btn.dataset.tab === 'sync' && !window._syncLoaded) {
-                loadSyncData();
+            try {
+                document.querySelectorAll('.tab-btn').forEach(b => b.classList.remove('active'));
+                document.querySelectorAll('.tab-panel').forEach(p => p.classList.remove('active'));
+                btn.classList.add('active');
+                document.getElementById('tab-' + btn.dataset.tab).classList.add('active');
+                
+                // Auto-load sync data when Sync tab is first clicked
+                if (btn.dataset.tab === 'sync' && !window._syncLoaded) {
+                    loadSyncData();
+                }
+            } catch (err) {
+                alert('Tab switch error: ' + err.message);
+                console.error(err);
             }
         });
     });
 
     // SharePoint Sync — load metadata
     function loadSyncData() {
-        const entity = document.querySelector('select[name="entity"]').value.toLowerCase();
-        document.getElementById('syncEntityLabel').textContent = entity.charAt(0).toUpperCase() + entity.slice(1);
-        const btn = document.getElementById('btnRefreshSync');
-        btn.disabled = true;
-        btn.innerHTML = '<i class="bi bi-arrow-clockwise spin"></i> Loading...';
-        document.getElementById('syncPlaceholder').style.display = 'none';
-        document.getElementById('syncResults').style.display = 'none';
+        try {
+            const entitySelect = document.querySelector('select[name="entity"]');
+            if (!entitySelect) throw new Error("Entity dropdown not found");
+            const entity = entitySelect.value.toLowerCase();
+            
+            const label = document.getElementById('syncEntityLabel');
+            if (label) label.textContent = entity.charAt(0).toUpperCase() + entity.slice(1);
+            
+            const btn = document.getElementById('btnRefreshSync');
+            if (btn) {
+                btn.disabled = true;
+                btn.innerHTML = '<i class="bi bi-arrow-clockwise spin"></i> Loading...';
+            }
+            
+            const msgObj = document.getElementById('syncPlaceholder');
+            const resObj = document.getElementById('syncResults');
+            if (msgObj) msgObj.style.display = 'none';
+            if (resObj) resObj.style.display = 'none';
 
-        fetch('/api/sync/' + entity, {
+            fetch('/api/sync/' + entity, {
             method: 'POST',
             headers: {'Content-Type': 'application/json'},
             body: JSON.stringify({})
@@ -2864,12 +2881,20 @@ HTML_TEMPLATE = """
             document.getElementById('syncResults').style.display = 'block';
         })
         .catch(err => {
-            btn.disabled = false;
-            btn.innerHTML = '<i class="bi bi-arrow-clockwise"></i> Refresh';
-            document.getElementById('syncPlaceholder').style.display = 'block';
-            document.getElementById('syncPlaceholder').innerHTML =
-                '<p style="color:var(--danger);font-size:.85rem;">Network error: ' + err + '</p>';
+            if (btn) {
+                btn.disabled = false;
+                btn.innerHTML = '<i class="bi bi-arrow-clockwise"></i> Refresh';
+            }
+            if (msgObj) {
+                msgObj.style.display = 'block';
+                msgObj.innerHTML =
+                    '<p style="color:var(--danger);font-size:.85rem;">Network error: ' + err + '</p>';
+            }
         });
+        } catch (err) {
+            alert('loadSyncData error: ' + err.message);
+            console.error(err);
+        }
     }
 
     // Stage individual statement or batch
@@ -3101,6 +3126,8 @@ def index():
     unmatched_rows = []
 
     if df_matches is not None and not df_matches.empty:
+        if "Status" not in df_matches.columns:
+            df_matches["Status"] = "unmatched"
         approved_df = df_matches[df_matches["Status"] == "auto_approved"]
         review_df = df_matches[df_matches["Status"] == "review"]
         unmatched_df = df_matches[df_matches["Status"] == "unmatched"]
@@ -3123,9 +3150,13 @@ def index():
     compare_data = []
     if df_matches is not None and not df_matches.empty:
         for _, row in df_matches.iterrows():
-            img_path = UPLOAD_DIR_RECEIPTS / row["Receipt File"]
+            img_filename = row.get("Receipt File", "")
+            if img_filename:
+                img_path = UPLOAD_DIR_RECEIPTS / img_filename
+            else:
+                img_path = None
             compare_data.append({
-                "receipt_file": row["Receipt File"],
+                "receipt_file": img_filename,
                 "receipt_vendor": row.get("Receipt Vendor", ""),
                 "receipt_amount": row.get("Receipt Amount", ""),
                 "receipt_date": row.get("Receipt Date", ""),
