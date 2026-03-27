@@ -3240,23 +3240,8 @@ HTML_TEMPLATE = """
         .then(function(r) { return r.json(); })
         .then(function(data) {
             if (data.ok) {
-                btnEl.textContent = "Staged!";
-                btnEl.style.background = "#059669";
-
-                // Update sidebar drop zones
-                if (type === "statement") {
-                    var stmtBadge = document.getElementById("stmtBadge");
-                    var stmtZone = document.getElementById("stmtZone");
-                    if (stmtBadge) stmtBadge.innerHTML = '<span class="file-badge" style="color:var(--success);"><i class="bi bi-cloud-check-fill"></i> ' + (data.filename || "SharePoint PDF") + '</span>';
-                    if (stmtZone) stmtZone.style.borderColor = "var(--success)";
-                } else if (type === "receipt_batch") {
-                    var rcptBadge = document.getElementById("receiptBadge");
-                    var rcptZone = document.getElementById("receiptZone");
-                    var fileNames = (data.files || []).join(", ");
-                    if (rcptBadge) rcptBadge.innerHTML = '<span class="file-badge" style="color:var(--success);"><i class="bi bi-cloud-check-fill"></i> ' + (data.count || "?") + ' receipt(s) staged</span>';
-                    if (rcptZone) rcptZone.style.borderColor = "var(--success)";
-                }
-                // Stay on sync panel — user can stage more files or close and click Process
+                // Poll for download completion
+                _pollStaging(type, btnEl, origText, fileName);
             } else {
                 btnEl.disabled = false;
                 btnEl.textContent = origText;
@@ -3269,6 +3254,41 @@ HTML_TEMPLATE = """
             btnEl.textContent = origText;
             btnEl.style.opacity = "1";
             alert("Error: " + err);
+        });
+    }
+
+    function _pollStaging(type, btnEl, origText, fileName) {
+        fetch("/api/stage/status")
+        .then(function(r) { return r.json(); })
+        .then(function(s) {
+            if (s.status === "downloading") {
+                btnEl.textContent = s.detail || "Downloading...";
+                setTimeout(function() { _pollStaging(type, btnEl, origText, fileName); }, 800);
+            } else if (s.status === "done") {
+                btnEl.textContent = "Staged!";
+                btnEl.style.background = "#059669";
+                btnEl.style.opacity = "1";
+                // Update sidebar drop zones
+                if (type === "statement") {
+                    var stmtBadge = document.getElementById("stmtBadge");
+                    var stmtZone = document.getElementById("stmtZone");
+                    if (stmtBadge) stmtBadge.innerHTML = '<span class="file-badge" style="color:var(--success);"><i class="bi bi-cloud-check-fill"></i> ' + (s.filename || fileName || "PDF") + '</span>';
+                    if (stmtZone) stmtZone.style.borderColor = "var(--success)";
+                } else if (type === "receipt_batch") {
+                    var rcptBadge = document.getElementById("receiptBadge");
+                    var rcptZone = document.getElementById("receiptZone");
+                    if (rcptBadge) rcptBadge.innerHTML = '<span class="file-badge" style="color:var(--success);"><i class="bi bi-cloud-check-fill"></i> ' + (s.count || "?") + ' receipt(s) staged</span>';
+                    if (rcptZone) rcptZone.style.borderColor = "var(--success)";
+                }
+            } else {
+                btnEl.disabled = false;
+                btnEl.textContent = origText;
+                btnEl.style.opacity = "1";
+                alert("Stage failed: " + (s.error || "Unknown error"));
+            }
+        })
+        .catch(function() {
+            setTimeout(function() { _pollStaging(type, btnEl, origText, fileName); }, 1500);
         });
     }
 })();
@@ -3653,42 +3673,65 @@ def api_stage_sharepoint(entity):
     if not item_id and not folder_id:
         return jsonify({"ok": False, "error": "item_id or folder_id required"}), 400
 
+    # Launch download in background thread — return immediately
+    _app_state["_staging"] = {"status": "downloading", "type": item_type, "detail": "Connecting to SharePoint..."}
+
+    t = threading.Thread(
+        target=_bg_stage_from_sharepoint,
+        args=(mapped, item_type, item_id, folder_id),
+        daemon=True,
+    )
+    t.start()
+    return jsonify({"ok": True, "status": "downloading"})
+
+
+@app.route("/api/stage/status")
+def api_stage_status():
+    """Poll staging progress."""
+    staging = _app_state.get("_staging", {})
+    return jsonify(staging)
+
+
+def _bg_stage_from_sharepoint(entity_key, item_type, item_id, folder_id):
+    """Background thread: download from SharePoint and save to uploads/."""
+    staging = _app_state["_staging"]
     try:
-        sp = SharePointManager(entity=mapped)
+        sp = SharePointManager(entity=entity_key)
         if not sp.is_authenticated:
-            return jsonify({"ok": False, "error": "SharePoint authentication failed"}), 500
+            staging.update({"status": "error", "error": "SharePoint auth failed"})
+            return
 
         if item_type == "statement" and item_id:
+            staging["detail"] = "Downloading statement PDF..."
             result = sp.get_file_content(item_id)
             if not result["ok"]:
-                return jsonify(result), 500
-            # Save PDF to uploads/statements/
+                staging.update({"status": "error", "error": result.get("error", "Download failed")})
+                return
             dest = UPLOAD_DIR_STATEMENTS / result["name"]
             dest.write_bytes(result["bytes"])
-            return jsonify({"ok": True, "filename": result["name"],
+            staging.update({"status": "done", "filename": result["name"],
                             "size": len(result["bytes"])})
 
         elif item_type == "receipt_batch" and folder_id:
+            staging["detail"] = "Listing folder contents..."
             folder_result = sp.get_folder_files(folder_id)
             if not folder_result["ok"]:
-                return jsonify(folder_result), 500
+                staging.update({"status": "error", "error": folder_result.get("error", "Folder failed")})
+                return
             files = folder_result["files"]
             if not files:
-                return jsonify({"ok": False, "error": "No image files in folder"})
-            # Save all images to uploads/receipts/
+                staging.update({"status": "error", "error": "No image files in folder"})
+                return
             saved = []
-            for f in files:
+            for i, f in enumerate(files):
+                staging["detail"] = f"Downloading {i+1}/{len(files)}: {f['name']}"
                 dest = UPLOAD_DIR_RECEIPTS / f["name"]
                 dest.write_bytes(f["bytes"])
                 saved.append(f["name"])
-            return jsonify({"ok": True, "count": len(saved),
-                            "files": saved})
-
-        else:
-            return jsonify({"ok": False, "error": f"Invalid type '{item_type}'"}), 400
+            staging.update({"status": "done", "count": len(saved), "files": saved})
 
     except Exception as e:
-        return jsonify({"ok": False, "error": str(e)}), 500
+        staging.update({"status": "error", "error": str(e)})
 
 
 def _bg_ocr_statement_bytes(pdf_bytes, filename):
