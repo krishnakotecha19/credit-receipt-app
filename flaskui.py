@@ -2833,7 +2833,7 @@ HTML_TEMPLATE = """
             if (msgObj) msgObj.style.display = 'none';
             if (resObj) resObj.style.display = 'none';
 
-            fetch('/api/sync/' + entity, {
+            fetch('/api/sync/' + encodeURIComponent(entity), {
             method: 'POST',
             headers: {'Content-Type': 'application/json'},
             body: JSON.stringify({})
@@ -2908,7 +2908,7 @@ HTML_TEMPLATE = """
         const payload = {};
         if (stmtId) payload.statement_id = stmtId;
         if (batchId) payload.batch_folder_id = batchId;
-        fetch('/api/sync/' + entity, {
+        fetch('/api/sync/' + encodeURIComponent(entity), {
             method: 'POST',
             headers: {'Content-Type': 'application/json'},
             body: JSON.stringify(payload)
@@ -3411,14 +3411,24 @@ def api_reassign_stmt():
     })
 
 
-@app.route("/api/sync/<entity>", methods=["POST"])
+_ENTITY_SYNC_MAP = {
+    "si2tech": "si2tech",
+    "vcare global": "vcare",
+    "vcare": "vcare",
+}
+
+
+@app.route("/api/sync/<path:entity>", methods=["POST"])
 def api_sync_entity(entity):
     """
     Sync SharePoint metadata for the given entity and stage selected files.
     Payload: { "statement_id": "...", "batch_folder_id": "..." }
     """
     try:
-        sp = SharePointManager(entity=entity)
+        mapped = _ENTITY_SYNC_MAP.get(entity.strip().lower())
+        if not mapped:
+            return jsonify({"ok": False, "error": f"Unknown entity '{entity}'"}), 400
+        sp = SharePointManager(entity=mapped)
         if not sp.is_authenticated:
             return jsonify({"ok": False, "error": "SharePoint authentication failed"}), 500
             
