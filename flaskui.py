@@ -978,6 +978,10 @@ def _match_transactions(df_receipts, df_statements):
                 "Cost Centre": "",
                 "GL Code": "",
                 "Approved By": "",
+                "OCR Receipt Confidence": round(float(receipt.get("confidence", 0)), 4),
+                "OCR Statement Confidence": round(float(stmt_row.get("confidence", 0)), 4),
+                "Row Construction Confidence": round(float(stmt_row.get("confidence", 0)), 4),
+                "Matched": "Yes" if best_score > 0 else "No",
             })
         else:
             credit_card_bank = _app_state.get("credit_card_bank", "")
@@ -996,6 +1000,10 @@ def _match_transactions(df_receipts, df_statements):
                 "Cost Centre": "",
                 "GL Code": "",
                 "Approved By": "",
+                "OCR Receipt Confidence": round(float(receipt.get("confidence", 0)), 4),
+                "OCR Statement Confidence": 0,
+                "Row Construction Confidence": 0,
+                "Matched": "No",
             })
 
     return pd.DataFrame(matches)
@@ -1720,23 +1728,6 @@ HTML_TEMPLATE = """
             margin-top: 0.5rem;
         }
 
-        /* ── Log Console ── */
-        .log-console {
-            background: #1E293B;
-            border-radius: var(--radius-sm);
-            padding: 1rem;
-            max-height: 180px;
-            overflow-y: auto;
-            font-family: 'JetBrains Mono', 'Fira Code', monospace;
-            font-size: 0.78rem;
-            color: #94A3B8;
-            margin-top: 0.75rem;
-        }
-        .log-console .log-line {
-            padding: 2px 0;
-        }
-        .log-console .log-line.success { color: var(--success); }
-        .log-console .log-line.error { color: var(--danger); }
 
         /* ── Receipt Comparison Card ── */
         .compare-card {
@@ -1971,11 +1962,6 @@ HTML_TEMPLATE = """
                 </div>
                 <div class="progress-detail" id="progressDetail">{{ progress.detail }}</div>
             </div>
-            <div class="log-console" id="logConsole">
-                {% for line in log_lines %}
-                <div class="log-line {{ 'success' if 'done' in line.lower() or 'complete' in line.lower() else ('error' if 'error' in line.lower() else '') }}">{{ line }}</div>
-                {% endfor %}
-            </div>
         </div>
     </aside>
 
@@ -2071,6 +2057,10 @@ HTML_TEMPLATE = """
                                     <th>Cost Centre</th>
                                     <th>GL Code</th>
                                     <th>Match Score</th>
+                                    <th>Receipt Scan Accuracy</th>
+                                    <th>Statement Scan Accuracy</th>
+                                    <th>Row Parsing Accuracy</th>
+                                    <th>Match Status</th>
                                 </tr>
                             </thead>
                             <tbody>
@@ -2101,6 +2091,10 @@ HTML_TEMPLATE = """
                                     </td>
                                     <td><span class="gl-code-display" data-idx="{{ row._idx }}">{{ row.gl_code or '—' }}</span></td>
                                     <td><span class="score-badge high">{{ row.match_score }}</span></td>
+                                    <td>{{ '%.0f%%'|format(row.ocr_receipt_confidence * 100) if row.ocr_receipt_confidence else '—' }}</td>
+                                    <td>{{ '%.0f%%'|format(row.ocr_statement_confidence * 100) if row.ocr_statement_confidence else '—' }}</td>
+                                    <td>{{ '%.0f%%'|format(row.row_construction_confidence * 100) if row.row_construction_confidence else '—' }}</td>
+                                    <td><span class="score-badge {{ 'high' if row.matched == 'Yes' else 'low' }}">{{ row.matched or '—' }}</span></td>
                                 </tr>
                                 {% endfor %}
                             </tbody>
@@ -2145,6 +2139,10 @@ HTML_TEMPLATE = """
                                     <th>Cost Centre</th>
                                     <th>GL Code</th>
                                     <th>Match Score</th>
+                                    <th>Receipt Scan Accuracy</th>
+                                    <th>Statement Scan Accuracy</th>
+                                    <th>Row Parsing Accuracy</th>
+                                    <th>Match Status</th>
                                     <th>Action</th>
                                 </tr>
                             </thead>
@@ -2176,6 +2174,10 @@ HTML_TEMPLATE = """
                                     </td>
                                     <td><span class="gl-code-display" data-idx="{{ row._idx }}">{{ row.gl_code or '—' }}</span></td>
                                     <td><span class="score-badge medium">{{ row.match_score }}</span></td>
+                                    <td>{{ '%.0f%%'|format(row.ocr_receipt_confidence * 100) if row.ocr_receipt_confidence else '—' }}</td>
+                                    <td>{{ '%.0f%%'|format(row.ocr_statement_confidence * 100) if row.ocr_statement_confidence else '—' }}</td>
+                                    <td>{{ '%.0f%%'|format(row.row_construction_confidence * 100) if row.row_construction_confidence else '—' }}</td>
+                                    <td><span class="score-badge {{ 'high' if row.matched == 'Yes' else 'low' }}">{{ row.matched or '—' }}</span></td>
                                     <td>
                                         <a href="#" class="btn btn-sm btn-success approve-btn" data-idx="{{ row._idx }}" style="font-size:0.75rem;">
                                             <i class="bi bi-check"></i> Approve
@@ -2644,16 +2646,6 @@ HTML_TEMPLATE = """
                 document.getElementById('stepPct').textContent = data.pct + '%';
                 document.getElementById('progressBar').style.width = data.pct + '%';
                 document.getElementById('progressDetail').textContent = data.detail;
-
-                // Update log
-                const console = document.getElementById('logConsole');
-                console.innerHTML = data.log.map(l => {
-                    let cls = '';
-                    if (l.toLowerCase().includes('done') || l.toLowerCase().includes('complete')) cls = 'success';
-                    if (l.toLowerCase().includes('error')) cls = 'error';
-                    return '<div class="log-line ' + cls + '">' + l + '</div>';
-                }).join('');
-                console.scrollTop = console.scrollHeight;
 
                 if (data.processing) {
                     setTimeout(pollProgress, 1000);
