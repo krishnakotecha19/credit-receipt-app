@@ -48,11 +48,16 @@ def _get_ocr():
 # Image preprocessing
 # ---------------------------------------------------------------------------
 
-def _fix_exif_orientation(img: np.ndarray, image_path: str) -> np.ndarray:
-    """Rotate image according to EXIF orientation tag so vertical photos stay vertical."""
+def _fix_exif_orientation(img: np.ndarray, image_source) -> np.ndarray:
+    """Rotate image according to EXIF orientation tag so vertical photos stay vertical.
+    image_source can be a file path (str) or raw bytes."""
     try:
         from PIL import Image
-        pil = Image.open(image_path)
+        import io
+        if isinstance(image_source, (bytes, bytearray)):
+            pil = Image.open(io.BytesIO(image_source))
+        else:
+            pil = Image.open(image_source)
         exif = pil.getexif()
         orientation = exif.get(274)  # 274 = Orientation tag
         if orientation == 3:
@@ -91,6 +96,17 @@ def preprocess_image(image_path: str) -> np.ndarray:
     if img is None:
         raise ValueError(f"Cannot read image: {image_path}")
     img = _fix_exif_orientation(img, image_path)
+    return _resize_image(img)
+
+
+def preprocess_image_bytes(img_bytes: bytes) -> np.ndarray:
+    """Preprocess an image from raw bytes (no disk I/O).
+    Uses cv2.imdecode instead of cv2.imread."""
+    arr = np.frombuffer(img_bytes, np.uint8)
+    img = cv2.imdecode(arr, cv2.IMREAD_COLOR)
+    if img is None:
+        raise ValueError("Cannot decode image from bytes")
+    img = _fix_exif_orientation(img, img_bytes)
     return _resize_image(img)
 
 
@@ -697,9 +713,10 @@ def _parse_llm_response(text: str) -> dict | None:
     return result if result else None
 
 
-def _extract_via_llm(image_path: str, raw_text: str) -> dict | None:
+def _extract_via_llm(image_source, raw_text: str) -> dict | None:
     """Send receipt to local Ollama for extraction.
 
+    image_source can be a file path (str) or a numpy ndarray.
     Uses VLM (qwen2.5vl:3b) if available — sends the actual image.
     Falls back to text-only (qwen2.5:3b) if VLM fails or isn't installed.
     Fully offline — no data leaves the machine.
@@ -714,7 +731,10 @@ def _extract_via_llm(image_path: str, raw_text: str) -> dict | None:
     # can be 3000x4000+ which makes VLM inference extremely slow.
     img_b64 = None
     try:
-        img = cv2.imread(image_path)
+        if isinstance(image_source, np.ndarray):
+            img = image_source.copy()
+        else:
+            img = cv2.imread(image_source)
         if img is not None:
             h, w = img.shape[:2]
             max_side = 1024
@@ -888,34 +908,127 @@ def extract_receipt_data(image_path: str) -> dict:
     return result
 
 
+def extract_receipt_data_bytes(img_bytes: bytes, filename: str) -> dict:
+    """Extract receipt data from raw image bytes (no disk I/O for input)."""
+    result = {
+        "receipt_file": filename,
+        "vendor": None, "amount": None, "date": None,
+        "raw_text": "", "confidence": 0.0, "status": "failed",
+    }
+
+    # Decode image once — reuse for both VLM and OCR
+    try:
+        processed_img = preprocess_image_bytes(img_bytes)
+    except ValueError:
+        return result
+
+    # Primary: VLM extracts directly from the image (numpy array)
+    llm = _extract_via_llm(processed_img, "")
+    if llm:
+        print(f"VLM result: {llm}", file=sys.stderr)
+        result.update({
+            "vendor": llm.get("vendor"),
+            "amount": llm.get("amount"),
+            "date": llm.get("date"),
+            "raw_text": (f"[VLM direct extraction — no OCR]\n"
+                         f"Vendor: {llm.get('vendor')}\n"
+                         f"Amount: {llm.get('amount')}\n"
+                         f"Date: {llm.get('date')}"),
+            "confidence": 0.95, "status": "success",
+            "llm_raw": llm,
+            "regex_vendor": None, "regex_amount": None, "regex_date": None,
+        })
+        return result
+
+    # Fallback: PaddleOCR + regex
+    print("VLM unavailable, falling back to OCR + regex", file=sys.stderr)
+    texts, scores = _run_ocr_on_image(processed_img)
+    avg_conf = sum(scores) / len(scores) if scores else 0.0
+
+    # Retry WITHOUT EXIF rotation if OCR looks like garbage
+    if not _ocr_quality_ok(texts, avg_conf):
+        try:
+            arr = np.frombuffer(img_bytes, np.uint8)
+            img_raw = cv2.imdecode(arr, cv2.IMREAD_COLOR)
+            if img_raw is not None:
+                img_raw = _resize_image(img_raw)
+                t2, s2 = _run_ocr_on_image(img_raw)
+                c2 = sum(s2) / len(s2) if s2 else 0.0
+                if c2 > avg_conf or (not texts and t2):
+                    texts, scores, avg_conf = t2, s2, c2
+        except Exception:
+            pass
+
+    if not texts:
+        return result
+
+    lines = list(texts)
+    full_text = "\n".join(lines)
+    extracted_date = _parse_date_from_all_lines(lines)
+    extracted_amount = _parse_amount(lines)
+    extracted_vendor = _extract_vendor(lines)
+
+    result.update({
+        "vendor": extracted_vendor, "amount": extracted_amount,
+        "date": extracted_date, "raw_text": full_text,
+        "confidence": round(avg_conf, 4), "status": "success",
+        "regex_vendor": extracted_vendor, "regex_amount": extracted_amount,
+        "regex_date": extracted_date,
+    })
+    return result
+
+
 if __name__ == "__main__":
     if len(sys.argv) < 2:
-        print(json.dumps({"error": "Usage: python ocr_receipt.py <image_path> [image_path2 ...]"}))
+        print(json.dumps({"error": "Usage: python ocr_receipt.py <image_path|--stdin> [image_path2 ...]"}))
         sys.exit(1)
 
-    image_paths = sys.argv[1:]
+    if sys.argv[1] == "--stdin":
+        # Binary stdin mode: read length-prefixed files
+        # Protocol: 4-byte file count N, then for each file:
+        #   4-byte name_len, name_bytes (UTF-8), 4-byte data_len, data_bytes
+        import struct
+        if sys.platform == "win32":
+            import msvcrt
+            msvcrt.setmode(sys.stdin.fileno(), os.O_BINARY)
+        raw = sys.stdin.buffer
 
-    if len(image_paths) == 1:
-        # Single-receipt mode — wrap in list for batch compatibility
-        data = extract_receipt_data(image_paths[0])
-        print(json.dumps([data], ensure_ascii=False))
-    else:
-        # ── Batch mode: process ALL receipts ──
-        # VLM is primary — no need to pre-warm PaddleOCR.
-        # OCR engine is only loaded on-demand if VLM is unavailable.
+        n_files = struct.unpack(">I", raw.read(4))[0]
         results = []
-        for path in image_paths:
+        for i in range(n_files):
+            name_len = struct.unpack(">I", raw.read(4))[0]
+            name = raw.read(name_len).decode("utf-8")
+            data_len = struct.unpack(">I", raw.read(4))[0]
+            data = raw.read(data_len)
+
             try:
-                data = extract_receipt_data(path)
+                r = extract_receipt_data_bytes(data, name)
             except Exception as e:
-                data = {
-                    "receipt_file": os.path.basename(path),
-                    "vendor": None, "amount": None, "date": None,
-                    "raw_text": f"Error: {e}",
-                    "confidence": 0.0, "status": "failed",
-                }
-            results.append(data)
-            # Flush per-receipt progress marker to stderr so the caller
-            # can update a progress bar while the batch is running.
-            print(f"PROGRESS:{len(results)}/{len(image_paths)}", file=sys.stderr, flush=True)
+                r = {"receipt_file": name, "vendor": None, "amount": None,
+                     "date": None, "raw_text": f"Error: {e}",
+                     "confidence": 0.0, "status": "failed"}
+            results.append(r)
+            print(f"PROGRESS:{len(results)}/{n_files}", file=sys.stderr, flush=True)
         print(json.dumps(results, ensure_ascii=False))
+    else:
+        # File path mode (backward compatible)
+        image_paths = sys.argv[1:]
+
+        if len(image_paths) == 1:
+            data = extract_receipt_data(image_paths[0])
+            print(json.dumps([data], ensure_ascii=False))
+        else:
+            results = []
+            for path in image_paths:
+                try:
+                    data = extract_receipt_data(path)
+                except Exception as e:
+                    data = {
+                        "receipt_file": os.path.basename(path),
+                        "vendor": None, "amount": None, "date": None,
+                        "raw_text": f"Error: {e}",
+                        "confidence": 0.0, "status": "failed",
+                    }
+                results.append(data)
+                print(f"PROGRESS:{len(results)}/{len(image_paths)}", file=sys.stderr, flush=True)
+            print(json.dumps(results, ensure_ascii=False))

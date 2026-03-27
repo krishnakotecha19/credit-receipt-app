@@ -29,3 +29,6 @@ Thumbs.db
 # Test files
 _test_*.png
 _test_*.jpg
+test_rendered.html
+test_script_*.js
+test_sync_script.js

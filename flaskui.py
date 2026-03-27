@@ -12,7 +12,7 @@ from dotenv import load_dotenv
 load_dotenv(override=True)
 
 from sharepoint_manager import SharePointManager
-import os, re, gc, json, subprocess, sys, threading, time, tempfile
+import os, re, gc, json, subprocess, sys, threading, time
 import pandas as pd
 import requests
 from pathlib import Path
@@ -278,6 +278,99 @@ def process_statement_pdf(pdf_path):
     except Exception as e:
         return [{"page_number": 1, "raw_ocr_words": [],
                  "status": f"failed: {e}"}]
+
+
+def process_statement_pdf_bytes(pdf_bytes: bytes):
+    """Run statement OCR via subprocess using stdin bytes (zero disk I/O)."""
+    try:
+        cmd = [sys.executable, _STATEMENT_WORKER, "--stdin"] + \
+              ([POPPLER_PATH] if POPPLER_PATH else [])
+        proc = subprocess.run(
+            cmd, input=pdf_bytes,
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            timeout=600, cwd=str(_SCRIPT_DIR),
+        )
+        if proc.returncode != 0:
+            return [{"page_number": 1, "raw_ocr_words": [],
+                     "status": f"failed: {proc.stderr.decode('utf-8', errors='replace')[:500]}"}]
+        return json.loads(proc.stdout.decode("utf-8"))
+    except Exception as e:
+        return [{"page_number": 1, "raw_ocr_words": [],
+                 "status": f"failed: {e}"}]
+
+
+def extract_receipts_batch_bytes(file_list, progress_callback=None):
+    """Run receipt OCR via subprocess using stdin bytes (zero disk I/O).
+    file_list: [{"name": "receipt.jpg", "bytes": b"..."}, ...]
+    Uses length-prefixed binary protocol over stdin."""
+    import struct
+
+    if not file_list:
+        return []
+
+    fallbacks = [
+        {"receipt_file": f["name"], "vendor": None, "amount": None,
+         "date": None, "raw_text": "", "confidence": 0.0, "status": "failed"}
+        for f in file_list
+    ]
+
+    # Build binary payload: 4-byte count, then per file: name_len + name + data_len + data
+    payload = struct.pack(">I", len(file_list))
+    for f in file_list:
+        name_bytes = f["name"].encode("utf-8")
+        payload += struct.pack(">I", len(name_bytes)) + name_bytes
+        payload += struct.pack(">I", len(f["bytes"])) + f["bytes"]
+
+    cmd = [sys.executable, _RECEIPT_WORKER, "--stdin"]
+    timeout = max(300, 90 * len(file_list))
+
+    try:
+        proc = subprocess.Popen(
+            cmd, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE, cwd=str(_SCRIPT_DIR),
+        )
+
+        stderr_lines = []
+        def _read_stderr():
+            for line in proc.stderr:
+                line_str = line.decode("utf-8", errors="replace") if isinstance(line, bytes) else line
+                stderr_lines.append(line_str)
+                if line_str.startswith("PROGRESS:") and progress_callback:
+                    try:
+                        done, total = line_str.strip().split(":")[1].split("/")
+                        progress_callback(int(done), int(total))
+                    except (ValueError, IndexError):
+                        pass
+
+        t = threading.Thread(target=_read_stderr, daemon=True)
+        t.start()
+
+        stdout, _ = proc.communicate(input=payload, timeout=timeout)
+        t.join(timeout=5)
+
+        if proc.returncode != 0:
+            err = "".join(stderr_lines)[:500]
+            for fb in fallbacks:
+                fb["raw_text"] = f"Subprocess error (exit {proc.returncode}): {err}"
+            return fallbacks
+        if not stdout or not stdout.strip():
+            for fb in fallbacks:
+                fb["raw_text"] = "Empty stdout"
+            return fallbacks
+
+        results = json.loads(stdout.decode("utf-8"))
+        if isinstance(results, list) and len(results) == len(file_list):
+            return results
+        return fallbacks
+    except subprocess.TimeoutExpired:
+        proc.kill()
+        for fb in fallbacks:
+            fb["raw_text"] = f"Timed out after {timeout}s"
+        return fallbacks
+    except Exception as e:
+        for fb in fallbacks:
+            fb["raw_text"] = f"Error: {e}"
+        return fallbacks
 
 
 # ---------------------------------------------------------------------------
@@ -3088,7 +3181,7 @@ HTML_TEMPLATE = """
                         var ocrBtn = document.createElement("button");
                         ocrBtn.textContent = "Run OCR";
                         ocrBtn.style.cssText = "font-size:.75rem;padding:4px 12px;background:linear-gradient(135deg,#10b981,#059669);color:#fff;border:none;border-radius:4px;cursor:pointer;font-weight:600;";
-                        ocrBtn.addEventListener("click", function() { _runOCR(entity, s.id, "statement", ocrBtn); });
+                        ocrBtn.addEventListener("click", function() { _runOCR(entity, s.id, "statement", ocrBtn, s.name); });
                         row.appendChild(nameEl);
                         row.appendChild(ocrBtn);
                         stmtBox.appendChild(row);
@@ -3109,7 +3202,7 @@ HTML_TEMPLATE = """
                         var ocrBtn = document.createElement("button");
                         ocrBtn.textContent = "Run OCR";
                         ocrBtn.style.cssText = "font-size:.75rem;padding:4px 12px;background:linear-gradient(135deg,#10b981,#059669);color:#fff;border:none;border-radius:4px;cursor:pointer;font-weight:600;";
-                        ocrBtn.addEventListener("click", function() { _runOCR(entity, b.id, "receipt_batch", ocrBtn); });
+                        ocrBtn.addEventListener("click", function() { _runOCR(entity, b.id, "receipt_batch", ocrBtn, b.name); });
                         brow.appendChild(bname);
                         brow.appendChild(ocrBtn);
                         batchBox.appendChild(brow);
@@ -3126,7 +3219,7 @@ HTML_TEMPLATE = """
         });
     }
 
-    function _runOCR(entity, id, type, btnEl) {
+    function _runOCR(entity, id, type, btnEl, fileName) {
         var origText = btnEl.textContent;
         btnEl.disabled = true;
         btnEl.textContent = "Downloading...";
@@ -3148,16 +3241,26 @@ HTML_TEMPLATE = """
         .then(function(data) {
             if (data.ok) {
                 if (data.status === "cached") {
-                    // Cached — reload immediately
                     alert("Loaded from cache: " + (data.transactions || 0) + " transactions");
                     location.reload();
                     return;
+                }
+                // Update sidebar drop zones to show SharePoint file
+                if (type === "statement") {
+                    var stmtBadge = document.getElementById("stmtBadge");
+                    var stmtZone = document.getElementById("stmtZone");
+                    if (stmtBadge) stmtBadge.innerHTML = '<span class="file-badge" style="color:var(--success);"><i class="bi bi-cloud-check-fill"></i> ' + (fileName || "SharePoint PDF") + '</span>';
+                    if (stmtZone) stmtZone.style.borderColor = "var(--success)";
+                } else if (type === "receipt_batch") {
+                    var rcptBadge = document.getElementById("receiptBadge");
+                    var rcptZone = document.getElementById("receiptZone");
+                    if (rcptBadge) rcptBadge.innerHTML = '<span class="file-badge" style="color:var(--success);"><i class="bi bi-cloud-check-fill"></i> ' + (data.count || "?") + ' receipt(s) from SharePoint</span>';
+                    if (rcptZone) rcptZone.style.borderColor = "var(--success)";
                 }
                 // OCR started in background — close sync, show progress, poll
                 btnEl.textContent = "OCR Running...";
                 btnEl.style.background = "#f59e0b";
                 _closeSync();
-                // Show progress section and poll
                 var progSection = document.getElementById("progressSection");
                 if (progSection) progSection.style.display = "block";
                 _pollUntilDone();
@@ -3588,13 +3691,10 @@ def api_ocr_sharepoint(entity):
                 _save_state()
                 return jsonify({"ok": True, "status": "cached",
                                 "transactions": len(cached_df)})
-            # Write to temp, launch background OCR
-            tmp = tempfile.NamedTemporaryFile(suffix=".pdf", delete=False)
-            tmp.write(result["bytes"])
-            tmp.close()
+            # Launch background OCR with bytes (zero disk)
             t = threading.Thread(
-                target=_bg_ocr_statement,
-                args=(tmp.name, result["name"]),
+                target=_bg_ocr_statement_bytes,
+                args=(result["bytes"], result["name"]),
                 daemon=True,
             )
             t.start()
@@ -3608,19 +3708,11 @@ def api_ocr_sharepoint(entity):
             files = folder_result["files"]
             if not files:
                 return jsonify({"ok": False, "error": "No image files in folder"})
-            # Write all to temp files
-            tmp_paths = []
-            name_map = {}
-            for f in files:
-                ext = f["name"].lower().rsplit(".", 1)[-1] if "." in f["name"] else "jpg"
-                tmp = tempfile.NamedTemporaryFile(suffix=f".{ext}", delete=False)
-                tmp.write(f["bytes"])
-                tmp.close()
-                tmp_paths.append(tmp.name)
-                name_map[tmp.name] = f["name"]
+            # Launch background OCR with bytes (zero disk)
+            file_list = [{"name": f["name"], "bytes": f["bytes"]} for f in files]
             t = threading.Thread(
-                target=_bg_ocr_receipts,
-                args=(tmp_paths, name_map),
+                target=_bg_ocr_receipts_bytes,
+                args=(file_list,),
                 daemon=True,
             )
             t.start()
@@ -3634,8 +3726,8 @@ def api_ocr_sharepoint(entity):
         return jsonify({"ok": False, "error": str(e)}), 500
 
 
-def _bg_ocr_statement(tmp_path, filename):
-    """Background thread: run statement OCR pipeline on a temp PDF."""
+def _bg_ocr_statement_bytes(pdf_bytes, filename):
+    """Background thread: run statement OCR from bytes (zero disk I/O)."""
     _app_state["processing"] = True
     _app_state["log_lines"] = []
 
@@ -3647,9 +3739,9 @@ def _bg_ocr_statement(tmp_path, filename):
 
     try:
         set_progress("Statements", 5, f"Running OCR on {filename}...")
-        log(f"OCR on SharePoint file: {filename}")
+        log(f"OCR on SharePoint file: {filename} (memory stream)")
 
-        pages = process_statement_pdf(tmp_path)
+        pages = process_statement_pdf_bytes(pdf_bytes)
         n_words = sum(len(p.get("raw_ocr_words", [])) for p in pages)
         log(f"OCR done: {len(pages)} page(s), {n_words} words")
 
@@ -3686,17 +3778,15 @@ def _bg_ocr_statement(tmp_path, filename):
         log(f"ERROR: {e}")
         set_progress("Done", 100, f"Error: {e}")
     finally:
-        try:
-            os.unlink(tmp_path)
-        except OSError:
-            pass
+        del pdf_bytes
         gc.collect()
         _save_state()
         _app_state["processing"] = False
 
 
-def _bg_ocr_receipts(tmp_paths, name_map):
-    """Background thread: run receipt OCR on temp image files."""
+def _bg_ocr_receipts_bytes(file_list):
+    """Background thread: run receipt OCR from bytes (zero disk I/O).
+    file_list: [{"name": ..., "bytes": ...}, ...]"""
     _app_state["processing"] = True
     _app_state["log_lines"] = []
 
@@ -3707,19 +3797,15 @@ def _bg_ocr_receipts(tmp_paths, name_map):
         _app_state["progress"] = {"step": step, "pct": pct, "detail": detail}
 
     try:
-        set_progress("Receipts", 5, f"Processing {len(tmp_paths)} receipt(s)...")
-        log(f"OCR on {len(tmp_paths)} receipt(s) from SharePoint")
+        set_progress("Receipts", 5, f"Processing {len(file_list)} receipt(s)...")
+        log(f"OCR on {len(file_list)} receipt(s) from SharePoint (memory stream)")
 
         def _cb(done, total):
             local_pct = done / total
             global_pct = max(5, int(5 + local_pct * 60))
             set_progress("Receipts", global_pct, f"Receipt {done}/{total}")
 
-        results = extract_receipts_batch(tmp_paths, progress_callback=_cb)
-
-        # Fix receipt_file names to original SharePoint filenames
-        for r, tp in zip(results, tmp_paths):
-            r["receipt_file"] = name_map.get(tp, r.get("receipt_file", ""))
+        results = extract_receipts_batch_bytes(file_list, progress_callback=_cb)
 
         n_ok = sum(1 for r in results if r.get("status") == "success")
         log(f"Receipts done: {n_ok} success, {len(results) - n_ok} failed")
@@ -3755,11 +3841,7 @@ def _bg_ocr_receipts(tmp_paths, name_map):
         log(f"ERROR: {e}")
         set_progress("Done", 100, f"Error: {e}")
     finally:
-        for tp in tmp_paths:
-            try:
-                os.unlink(tp)
-            except OSError:
-                pass
+        del file_list
         gc.collect()
         _save_state()
         _app_state["processing"] = False

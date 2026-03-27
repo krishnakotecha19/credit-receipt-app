@@ -1,7 +1,8 @@
 """Subprocess worker: DocTR-based statement PDF OCR.
 
 Usage:
-    python ocr_statement.py <pdf_path> <poppler_path>
+    python ocr_statement.py <pdf_path> [poppler_path]
+    python ocr_statement.py --stdin [poppler_path]   # read PDF bytes from stdin
 
 Prints JSON to stdout: list of page dicts with keys:
     page_number, raw_ocr_words (list of {text, confidence, x_min, y_min, x_max, y_max, has_plus_prefix}), status
@@ -203,9 +204,9 @@ def _is_green_text(img_rgb: np.ndarray, x_min: float, y_min: float,
 # ---------------------------------------------------------------------------
 
 def process_statement_pdf(pdf_path: str, poppler_path: str = None) -> list[dict]:
+    """Process a statement PDF from a file path."""
     from pdf2image import convert_from_path
 
-    pages_out = []
     try:
         kwargs = {"dpi": 350}
         if poppler_path:
@@ -213,6 +214,28 @@ def process_statement_pdf(pdf_path: str, poppler_path: str = None) -> list[dict]
         pil_images = convert_from_path(pdf_path, **kwargs)
     except Exception as e:
         return [{"page_number": 1, "raw_ocr_words": [], "status": f"failed: {e}"}]
+
+    return _process_pil_images(pil_images)
+
+
+def process_statement_pdf_bytes(pdf_bytes: bytes, poppler_path: str = None) -> list[dict]:
+    """Process a statement PDF from raw bytes (no disk I/O for the PDF)."""
+    from pdf2image import convert_from_bytes
+
+    try:
+        kwargs = {"dpi": 350}
+        if poppler_path:
+            kwargs["poppler_path"] = poppler_path
+        pil_images = convert_from_bytes(pdf_bytes, **kwargs)
+    except Exception as e:
+        return [{"page_number": 1, "raw_ocr_words": [], "status": f"failed: {e}"}]
+
+    return _process_pil_images(pil_images)
+
+
+def _process_pil_images(pil_images) -> list[dict]:
+    """Shared logic: run DocTR on PIL images and extract word-level OCR data."""
+    pages_out = []
 
     model = _get_doctr()
 
@@ -365,10 +388,20 @@ def process_statement_pdf(pdf_path: str, poppler_path: str = None) -> list[dict]
 
 if __name__ == "__main__":
     if len(sys.argv) < 2:
-        print(json.dumps([{"error": "Usage: python ocr_statement.py <pdf_path> [poppler_path]"}]))
+        print(json.dumps([{"error": "Usage: python ocr_statement.py <pdf_path|--stdin> [poppler_path]"}]))
         sys.exit(1)
 
-    pdf_path = sys.argv[1]
-    poppler_path = sys.argv[2] if len(sys.argv) >= 3 else None
-    pages = process_statement_pdf(pdf_path, poppler_path)
+    if sys.argv[1] == "--stdin":
+        # Read PDF bytes from stdin (binary mode)
+        if sys.platform == "win32":
+            import msvcrt
+            msvcrt.setmode(sys.stdin.fileno(), os.O_BINARY)
+        pdf_bytes = sys.stdin.buffer.read()
+        poppler_path = sys.argv[2] if len(sys.argv) >= 3 else None
+        pages = process_statement_pdf_bytes(pdf_bytes, poppler_path)
+    else:
+        pdf_path = sys.argv[1]
+        poppler_path = sys.argv[2] if len(sys.argv) >= 3 else None
+        pages = process_statement_pdf(pdf_path, poppler_path)
+
     print(json.dumps(pages, ensure_ascii=False))
