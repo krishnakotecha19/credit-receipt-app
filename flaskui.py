@@ -123,8 +123,14 @@ app.config["MAX_CONTENT_LENGTH"] = 100 * 1024 * 1024  # 100 MB
 
 @app.route("/favicon.ico")
 def favicon():
-    """Return empty favicon to suppress browser 404 errors."""
-    return Response(status=204)
+    """Return a minimal 1x1 transparent ICO to suppress browser errors."""
+    # 1x1 transparent ICO (62 bytes)
+    import base64
+    ico = base64.b64decode(
+        "AAABAAEAAQEAAAEAGAAwAAAAFgAAACgAAAABAAAAAgAAAAEAGAAAAAAAAAAAAAAAAAAAA"
+        "AAAAAAAAAAAAAAAAAAAAAAA"
+    )
+    return Response(ico, mimetype="image/x-icon")
 
 # ---------------------------------------------------------------------------
 # In-memory state (replaces Streamlit session_state)
@@ -2189,30 +2195,30 @@ HTML_TEMPLATE = """
 
         <!-- Tabs -->
         <div class="nav-tabs-custom">
-            <button class="tab-btn active" data-tab="approved">
+            <button type="button" class="tab-btn active" data-tab="approved">
                 <i class="bi bi-check-circle"></i> Auto-Approved
                 {% if n_approved %}<span class="badge-count">{{ n_approved }}</span>{% endif %}
             </button>
-            <button class="tab-btn" data-tab="review">
+            <button type="button" class="tab-btn" data-tab="review">
                 <i class="bi bi-exclamation-circle"></i> Needs Review
                 {% if n_review %}<span class="badge-count">{{ n_review }}</span>{% endif %}
             </button>
-            <button class="tab-btn" data-tab="unmatched">
+            <button type="button" class="tab-btn" data-tab="unmatched">
                 <i class="bi bi-x-circle"></i> Unmatched
                 {% if n_unmatched %}<span class="badge-count">{{ n_unmatched }}</span>{% endif %}
             </button>
-            <button class="tab-btn" data-tab="credits">
+            <button type="button" class="tab-btn" data-tab="credits">
                 <i class="bi bi-arrow-down-left-circle"></i> Credits
                 {% if n_credits %}<span class="badge-count">{{ n_credits }}</span>{% endif %}
             </button>
 
-            <button class="tab-btn" data-tab="compare">
+            <button type="button" class="tab-btn" data-tab="compare">
                 <i class="bi bi-columns-gap"></i> Receipt vs Statement
             </button>
-            <button class="tab-btn" data-tab="debug">
+            <button type="button" class="tab-btn" data-tab="debug">
                 <i class="bi bi-bug"></i> Debug
             </button>
-            <button class="tab-btn" data-tab="sync" id="btnSyncSP" style="margin-left:auto; background:linear-gradient(135deg,#06B6D4,#3B82F6); color:#fff; border-radius:var(--radius-sm); font-weight:600;">
+            <button type="button" class="tab-btn" data-tab="sync" id="btnSyncSP" style="margin-left:auto; background:linear-gradient(135deg,#06B6D4,#3B82F6); color:#fff; border-radius:var(--radius-sm); font-weight:600;">
                 <i class="bi bi-cloud-arrow-down"></i> Sync SharePoint
             </button>
         </div>
@@ -2748,7 +2754,7 @@ HTML_TEMPLATE = """
             <div class="data-card">
                 <div class="card-header">
                     <h5><i class="bi bi-cloud-arrow-down" style="color:var(--accent)"></i> SharePoint Browser — <span id="syncEntityLabel">{{ entity }}</span></h5>
-                    <button class="btn btn-sm btn-outline-primary" id="btnRefreshSync" onclick="loadSyncData()">
+                    <button type="button" class="btn btn-sm btn-outline-primary" id="btnRefreshSync" onclick="loadSyncData()">
                         <i class="bi bi-arrow-clockwise"></i> Refresh
                     </button>
                 </div>
