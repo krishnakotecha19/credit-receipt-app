@@ -914,19 +914,16 @@ def _match_transactions(df_receipts, df_statements):
                 except (ValueError, TypeError):
                     pass
 
-            # Amount check (mandatory gate)
+            # Amount check — EXACT match only (no tolerance)
             amount_exact = False
-            amount_tol = False
             if r_amount is not None and s_amount is not None:
                 try:
                     diff = abs(float(r_amount) - float(s_amount))
-                    amount_exact = diff == 0
-                    amount_tol = (diff <= 1.0 or
-                                  (float(r_amount) > 0 and diff <= float(r_amount) * 0.05))
+                    amount_exact = (diff == 0)
                 except (ValueError, TypeError):
                     pass
 
-            if not amount_tol:
+            if not amount_exact:
                 continue
 
             # Date check
@@ -940,16 +937,16 @@ def _match_transactions(df_receipts, df_statements):
             # Vendor check
             vendor_ok, _ = _vendor_match(r_vendor, s_desc)
 
-            # Tier scoring
+            # Tier scoring (amount is always exact at this point)
             score = 0
             if date_exact and amount_exact:
                 score = 100
             elif amount_exact and date_ok:
                 score = 90
-            elif vendor_ok and date_ok and amount_tol:
+            elif amount_exact and vendor_ok:
+                score = 80
+            elif amount_exact:
                 score = 70
-            elif amount_tol:
-                score = 50
 
             if score > best_score:
                 best_score = score
@@ -1018,6 +1015,12 @@ def _run_processing(receipt_paths, statement_path, entity):
     IMPORTANT: Each step (receipts, statements, matching) is wrapped in its
     own try/except so that a failure in one step NEVER prevents the other
     steps from running.
+
+    Progress uses a GLOBAL 1-100% range so the bar never sticks at 0%:
+      Receipts  →  1 – 25%
+      Statements → 26 – 50%
+      Matching  → 51 – 75%
+      Done      → 100%
     """
     _app_state["processing"] = True
     _app_state["log_lines"] = []
@@ -1029,17 +1032,21 @@ def _run_processing(receipt_paths, statement_path, entity):
     def set_progress(step, pct, detail=""):
         _app_state["progress"] = {"step": step, "pct": pct, "detail": detail}
 
-    # ── Step 1: Receipts ─────────────────────────────────────────────────
+    # ── Step 1: Receipts (1% – 25%) ──────────────────────────────────────
     if receipt_paths:
         try:
-            set_progress("Receipts", 0, "Processing receipts...")
+            set_progress("Receipts", 1, "Starting receipt processing...")
             log(f"Processing {len(receipt_paths)} receipt(s)...")
 
             def _cb(done, total):
-                set_progress("Receipts", int(done / total * 100),
+                # Map receipt progress 0-100% into global 1-25%
+                local_pct = done / total
+                global_pct = max(1, int(1 + local_pct * 24))
+                set_progress("Receipts", global_pct,
                              f"Receipt {done}/{total}")
 
             results = extract_receipts_batch(receipt_paths, progress_callback=_cb)
+            set_progress("Receipts", 25, "Receipts complete")
             n_ok = sum(1 for r in results if r.get("status") == "success")
             n_fail = len(results) - n_ok
             log(f"Receipts done: {n_ok} success, {n_fail} failed")
@@ -1061,12 +1068,14 @@ def _run_processing(receipt_paths, statement_path, entity):
             gc.collect()
         except Exception as e:
             log(f"ERROR in receipt processing: {e}")
-            # Continue to statement processing regardless
+            set_progress("Receipts", 25, "Receipts failed — continuing...")
+    else:
+        set_progress("Receipts", 25, "No receipts to process")
 
-    # ── Step 2: Statements ───────────────────────────────────────────────
+    # ── Step 2: Statements (26% – 50%) ───────────────────────────────────
     if statement_path:
         try:
-            set_progress("Statements", 0, "OCR on statement...")
+            set_progress("Statements", 26, "Starting statement OCR...")
             log("Running DocTR OCR on statement...")
 
             # Check cache first
@@ -1074,8 +1083,10 @@ def _run_processing(receipt_paths, statement_path, entity):
             cached_df = _load_stmt_cache(stmt_name)
             if cached_df is not None:
                 _app_state["df_statements"] = cached_df
+                set_progress("Statements", 50, "Loaded from cache")
                 log(f"Loaded statement from cache: {len(cached_df)} transactions")
             else:
+                set_progress("Statements", 28, "Running OCR...")
                 pages = process_statement_pdf(str(statement_path))
                 n_words = sum(len(p.get("raw_ocr_words", [])) for p in pages)
                 log(f"OCR done: {len(pages)} page(s), {n_words} words")
@@ -1090,7 +1101,7 @@ def _run_processing(receipt_paths, statement_path, entity):
                     for p in pages
                 ]
 
-                set_progress("Statements", 40, "Building rows...")
+                set_progress("Statements", 36, "Building rows...")
                 raw_rows, confs = _build_raw_text_rows(pages)
                 log(f"Built {len(raw_rows)} raw row(s)")
 
@@ -1098,11 +1109,11 @@ def _run_processing(receipt_paths, statement_path, entity):
                 _app_state["debug_stmt_raw_rows"] = raw_rows
 
                 if raw_rows:
-                    set_progress("Statements", 60, "Parsing rows...")
+                    set_progress("Statements", 42, "Parsing rows...")
                     parsed = _parse_rows_columnar(raw_rows)
                     log(f"Parsed {len(parsed)} transaction(s)")
 
-                    set_progress("Statements", 80, "Validating...")
+                    set_progress("Statements", 46, "Validating...")
                     df_stmts = _validate_transactions(parsed, confs, raw_rows)
                     _app_state["df_statements"] = df_stmts
                     _save_stmt_cache(stmt_name, df_stmts)
@@ -1110,18 +1121,22 @@ def _run_processing(receipt_paths, statement_path, entity):
                 else:
                     log("No rows reconstructed from statement.")
                 gc.collect()
+            set_progress("Statements", 50, "Statement processing complete")
         except Exception as e:
             log(f"ERROR in statement processing: {e}")
-            # Continue to matching regardless
+            set_progress("Statements", 50, "Statement failed — continuing...")
+    else:
+        set_progress("Statements", 50, "No statement to process")
 
-    # ── Step 3: Matching ─────────────────────────────────────────────────
+    # ── Step 3: Matching (51% – 75%) ─────────────────────────────────────
     if _app_state.get("df_receipts") is not None and _app_state.get("df_statements") is not None:
         try:
-            set_progress("Matching", 0, "Matching receipts to transactions...")
+            set_progress("Matching", 51, "Matching receipts to transactions...")
             log("Matching receipts to transactions...")
             df_matches = _match_transactions(
                 _app_state["df_receipts"], _app_state["df_statements"])
             _app_state["df_matches"] = df_matches
+            set_progress("Matching", 75, "Matching complete")
             n_auto = len(df_matches[df_matches["Status"] == "auto_approved"])
             n_review = len(df_matches[df_matches["Status"] == "review"])
             n_un = len(df_matches[df_matches["Match Score"] == 0])
@@ -2236,9 +2251,18 @@ HTML_TEMPLATE = """
                                         <span style="color:var(--text-muted);"><i class="bi bi-image"></i></span>
                                         {% endif %}
                                     </td>
-                                    <td>{{ row.statement_description or '—' }}</td>
-                                    <td>{{ '%.2f'|format(row.statement_amount|float) if row.statement_amount else '—' }}</td>
-                                    <td>{{ row.statement_date or '—' }}</td>
+                                    <td>
+                                        <select class="form-select form-select-sm stmt-select" data-idx="{{ row._idx }}" style="min-width:220px; font-size:0.78rem;">
+                                            <option value="">— Select Transaction —</option>
+                                            {% for txn in all_debit_txns %}
+                                            <option value="{{ txn.idx }}" {{ 'selected' if txn.description == row.statement_description else '' }}>
+                                                {{ txn.date }} | {{ txn.description[:40] }} | ₹{{ '%.2f'|format(txn.amount) }}
+                                            </option>
+                                            {% endfor %}
+                                        </select>
+                                    </td>
+                                    <td class="stmt-amount" data-idx="{{ row._idx }}">{{ '%.2f'|format(row.statement_amount|float) if row.statement_amount else '—' }}</td>
+                                    <td class="stmt-date" data-idx="{{ row._idx }}">{{ row.statement_date or '—' }}</td>
                                     <td>{{ row.receipt_vendor or '—' }}</td>
                                     <td>{{ '%.2f'|format(row.receipt_amount|float) if row.receipt_amount else '—' }}</td>
                                     <td>{{ row.receipt_date or '—' }}</td>
@@ -2320,9 +2344,18 @@ HTML_TEMPLATE = """
                                         <span style="color:var(--text-muted);"><i class="bi bi-image"></i></span>
                                         {% endif %}
                                     </td>
-                                    <td>{{ row.statement_description or '—' }}</td>
-                                    <td>{{ '%.2f'|format(row.statement_amount|float) if row.statement_amount else '—' }}</td>
-                                    <td>{{ row.statement_date or '—' }}</td>
+                                    <td>
+                                        <select class="form-select form-select-sm stmt-select" data-idx="{{ row._idx }}" style="min-width:220px; font-size:0.78rem;">
+                                            <option value="">— Select Transaction —</option>
+                                            {% for txn in all_debit_txns %}
+                                            <option value="{{ txn.idx }}" {{ 'selected' if txn.description == row.statement_description else '' }}>
+                                                {{ txn.date }} | {{ txn.description[:40] }} | ₹{{ '%.2f'|format(txn.amount) }}
+                                            </option>
+                                            {% endfor %}
+                                        </select>
+                                    </td>
+                                    <td class="stmt-amount" data-idx="{{ row._idx }}">{{ '%.2f'|format(row.statement_amount|float) if row.statement_amount else '—' }}</td>
+                                    <td class="stmt-date" data-idx="{{ row._idx }}">{{ row.statement_date or '—' }}</td>
                                     <td>{{ row.receipt_vendor or '—' }}</td>
                                     <td>{{ '%.2f'|format(row.receipt_amount|float) if row.receipt_amount else '—' }}</td>
                                     <td>{{ row.receipt_date or '—' }}</td>
@@ -2800,6 +2833,39 @@ HTML_TEMPLATE = """
         });
     });
 
+    // Statement transaction reassignment dropdown
+    document.querySelectorAll('.stmt-select').forEach(sel => {
+        sel.addEventListener('change', function() {
+            const matchIdx = parseInt(this.dataset.idx);
+            const stmtIdx = parseInt(this.value);
+            if (isNaN(stmtIdx)) return;
+            fetch('/api/reassign-stmt', {
+                method: 'POST',
+                headers: {'Content-Type': 'application/json'},
+                body: JSON.stringify({idx: matchIdx, stmt_idx: stmtIdx})
+            })
+            .then(r => r.json())
+            .then(data => {
+                if (!data.ok) { alert(data.error || 'Reassign failed'); return; }
+                // Update the amount and date cells in this row
+                const amtCell = document.querySelector('.stmt-amount[data-idx="' + matchIdx + '"]');
+                const dateCell = document.querySelector('.stmt-date[data-idx="' + matchIdx + '"]');
+                if (amtCell && data.stmt_amount != null) amtCell.textContent = data.stmt_amount.toFixed(2);
+                if (dateCell) dateCell.textContent = data.stmt_date || '—';
+                // Update score badge
+                const row = this.closest('tr');
+                if (row) {
+                    const scoreBadge = row.querySelector('.score-badge');
+                    if (scoreBadge) {
+                        scoreBadge.textContent = data.match_score;
+                        scoreBadge.className = 'score-badge ' + (data.match_score > 90 ? 'high' : data.match_score >= 70 ? 'medium' : 'low');
+                    }
+                }
+            })
+            .catch(err => console.error('Reassign error:', err));
+        });
+    });
+
     // Poll progress if processing
     {% if processing %}
     window._progressStartTime = window._progressStartTime || Date.now();
@@ -2956,6 +3022,18 @@ def index():
     cc_map = ENTITY_COST_MAP.get(sel_entity, {})
     cost_centre_options = list(cc_map.keys())
 
+    # All debit transactions for the editable statement dropdown
+    all_debit_txns = []
+    if df_statements is not None and not df_statements.empty:
+        debit_df = df_statements[df_statements["type"].str.lower() != "credit"]
+        for si, sr in debit_df.iterrows():
+            all_debit_txns.append({
+                "idx": int(si),
+                "description": sr.get("description", ""),
+                "amount": float(sr["amount"]) if sr.get("amount") is not None else 0,
+                "date": sr.get("date", ""),
+            })
+
     return render_template_string(
         HTML_TEMPLATE,
         entity=sel_entity,
@@ -2978,6 +3056,7 @@ def index():
         debug_receipts=debug_receipts,
         debug_stmt_ocr_words=debug_stmt_ocr_words,
         debug_stmt_raw_rows=debug_stmt_raw_rows,
+        all_debit_txns=all_debit_txns,
         processing=_app_state.get("processing", False),
         progress=_app_state.get("progress", {"step": "", "pct": 0, "detail": ""}),
         log_lines=_app_state.get("log_lines", []),
@@ -3080,6 +3159,84 @@ def api_update_cc():
         df.at[idx, "GL Code"] = gl
         _save_state()
     return jsonify({"ok": True})
+
+
+@app.route("/api/reassign-stmt", methods=["POST"])
+def api_reassign_stmt():
+    """Reassign a match row to a different statement transaction.
+
+    Expects JSON: {idx: <match_row_index>, stmt_idx: <statement_df_index>}
+    Updates the matched statement desc/amount/date, recalculates score, and persists.
+    """
+    data = request.get_json(force=True)
+    idx = data.get("idx")
+    stmt_idx = data.get("stmt_idx")
+    df_matches = _app_state.get("df_matches")
+    df_statements = _app_state.get("df_statements")
+
+    if df_matches is None or df_statements is None:
+        return jsonify({"ok": False, "error": "No data loaded"}), 400
+    if idx is None or idx not in df_matches.index:
+        return jsonify({"ok": False, "error": "Invalid match index"}), 400
+    if stmt_idx is None or stmt_idx not in df_statements.index:
+        return jsonify({"ok": False, "error": "Invalid statement index"}), 400
+
+    stmt_row = df_statements.loc[stmt_idx]
+    match_row = df_matches.loc[idx]
+
+    # Update statement fields
+    df_matches.at[idx, "Statement Description"] = stmt_row.get("description", "")
+    df_matches.at[idx, "Statement Amount"] = stmt_row.get("amount")
+    df_matches.at[idx, "Statement Date"] = stmt_row.get("date", "")
+    df_matches.at[idx, "OCR Statement Confidence"] = round(float(stmt_row.get("confidence", 0)), 4)
+    df_matches.at[idx, "Row Construction Confidence"] = round(float(stmt_row.get("confidence", 0)), 4)
+
+    # Recalculate match score
+    r_amount = match_row.get("Receipt Amount")
+    s_amount = stmt_row.get("amount")
+    score = 0
+    if r_amount is not None and s_amount is not None:
+        try:
+            diff = abs(float(r_amount) - float(s_amount))
+            if diff == 0:
+                # Check date
+                r_date_str = match_row.get("Receipt Date")
+                s_date_str = stmt_row.get("date")
+                r_date = pd.to_datetime(r_date_str) if r_date_str else None
+                s_date = pd.to_datetime(s_date_str) if s_date_str else None
+                if r_date and s_date and abs((r_date - s_date).days) == 0:
+                    score = 100
+                elif r_date and s_date and abs((r_date - s_date).days) <= 2:
+                    score = 90
+                else:
+                    score = 70
+            else:
+                score = 50  # Manual override — user chose this
+        except (ValueError, TypeError):
+            score = 50
+
+    if score == 0:
+        score = 50  # Manual assignment always gets at least 50
+
+    df_matches.at[idx, "Match Score"] = score
+    df_matches.at[idx, "Matched"] = "Yes"
+
+    # Update status based on new score
+    if score > 90:
+        df_matches.at[idx, "Status"] = "auto_approved"
+    elif score >= 50:
+        df_matches.at[idx, "Status"] = "review"
+
+    _save_state()
+
+    return jsonify({
+        "ok": True,
+        "stmt_description": stmt_row.get("description", ""),
+        "stmt_amount": float(stmt_row["amount"]) if stmt_row.get("amount") is not None else None,
+        "stmt_date": stmt_row.get("date", ""),
+        "match_score": score,
+        "status": df_matches.at[idx, "Status"],
+    })
 
 
 @app.route("/clear")
