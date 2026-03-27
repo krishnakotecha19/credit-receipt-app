@@ -1398,26 +1398,26 @@ HTML_TEMPLATE = """
 
         .upload-zone {
             border: 2px dashed var(--border);
-            border-radius: var(--radius);
-            padding: 1.25rem;
+            border-radius: var(--radius-sm);
+            padding: 0.6rem 0.75rem;
             text-align: center;
             transition: all 0.2s;
             cursor: pointer;
             background: var(--surface-alt);
-            margin-bottom: 0.75rem;
+            margin-bottom: 0.5rem;
         }
         .upload-zone:hover, .upload-zone.dragover {
             border-color: var(--primary);
             background: rgba(79, 70, 229, 0.04);
         }
         .upload-zone i {
-            font-size: 1.75rem;
+            font-size: 1.2rem;
             color: var(--primary-light);
-            margin-bottom: 0.5rem;
+            margin-bottom: 0.25rem;
             display: block;
         }
         .upload-zone p {
-            font-size: 0.82rem;
+            font-size: 0.75rem;
             color: var(--text-muted);
             margin: 0;
         }
@@ -2206,6 +2206,9 @@ HTML_TEMPLATE = """
             <button class="tab-btn" data-tab="debug">
                 <i class="bi bi-bug"></i> Debug
             </button>
+            <button class="tab-btn" data-tab="sync" id="btnSyncSP" style="margin-left:auto; background:linear-gradient(135deg,#06B6D4,#3B82F6); color:#fff; border-radius:var(--radius-sm); font-weight:600;">
+                <i class="bi bi-cloud-arrow-down"></i> Sync SharePoint
+            </button>
         </div>
 
         <!-- Tab: Auto-Approved -->
@@ -2734,6 +2737,38 @@ HTML_TEMPLATE = """
 
         </div>
 
+        <!-- Tab: Sync SharePoint -->
+        <div class="tab-panel" id="tab-sync">
+            <div class="data-card">
+                <div class="card-header">
+                    <h5><i class="bi bi-cloud-arrow-down" style="color:var(--accent)"></i> SharePoint Browser — <span id="syncEntityLabel">{{ entity }}</span></h5>
+                    <button class="btn btn-sm btn-outline-primary" id="btnRefreshSync" onclick="loadSyncData()">
+                        <i class="bi bi-arrow-clockwise"></i> Refresh
+                    </button>
+                </div>
+                <div class="card-body padded" id="syncContent">
+                    <div class="empty-state" id="syncPlaceholder">
+                        <i class="bi bi-cloud" style="font-size:2.5rem;color:var(--accent);display:block;margin-bottom:.5rem;"></i>
+                        <p style="color:var(--text-muted);font-size:.85rem;">Click <strong>Refresh</strong> to load files from SharePoint.</p>
+                    </div>
+                    <div id="syncResults" style="display:none;">
+                        <div style="display:grid;grid-template-columns:1fr 1fr;gap:1.5rem;">
+                            <!-- Statements column -->
+                            <div>
+                                <h6 style="font-size:.8rem;font-weight:700;text-transform:uppercase;letter-spacing:.06em;color:var(--text-muted);margin-bottom:.75rem;"><i class="bi bi-file-earmark-pdf"></i> Inbound Statements</h6>
+                                <div id="syncStatements" style="display:flex;flex-direction:column;gap:6px;"></div>
+                            </div>
+                            <!-- Receipt Batches column -->
+                            <div>
+                                <h6 style="font-size:.8rem;font-weight:700;text-transform:uppercase;letter-spacing:.06em;color:var(--text-muted);margin-bottom:.75rem;"><i class="bi bi-folder"></i> Inbound Receipt Batches</h6>
+                                <div id="syncBatches" style="display:flex;flex-direction:column;gap:6px;"></div>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+            </div>
+        </div>
+
 
     </main>
 </div>
@@ -2758,8 +2793,107 @@ HTML_TEMPLATE = """
             document.querySelectorAll('.tab-panel').forEach(p => p.classList.remove('active'));
             btn.classList.add('active');
             document.getElementById('tab-' + btn.dataset.tab).classList.add('active');
+            // Auto-load sync data when Sync tab is first clicked
+            if (btn.dataset.tab === 'sync' && !window._syncLoaded) {
+                loadSyncData();
+            }
         });
     });
+
+    // SharePoint Sync — load metadata
+    function loadSyncData() {
+        const entity = document.querySelector('select[name="entity"]').value.toLowerCase();
+        document.getElementById('syncEntityLabel').textContent = entity.charAt(0).toUpperCase() + entity.slice(1);
+        const btn = document.getElementById('btnRefreshSync');
+        btn.disabled = true;
+        btn.innerHTML = '<i class="bi bi-arrow-clockwise spin"></i> Loading...';
+        document.getElementById('syncPlaceholder').style.display = 'none';
+        document.getElementById('syncResults').style.display = 'none';
+
+        fetch('/api/sync/' + entity, {
+            method: 'POST',
+            headers: {'Content-Type': 'application/json'},
+            body: JSON.stringify({})
+        })
+        .then(r => r.json())
+        .then(data => {
+            btn.disabled = false;
+            btn.innerHTML = '<i class="bi bi-arrow-clockwise"></i> Refresh';
+            if (!data.ok) {
+                document.getElementById('syncPlaceholder').style.display = 'block';
+                document.getElementById('syncPlaceholder').innerHTML =
+                    '<i class="bi bi-exclamation-triangle" style="font-size:2rem;color:var(--warning);display:block;margin-bottom:.5rem;"></i>' +
+                    '<p style="color:var(--danger);font-size:.85rem;">' + (data.error || 'Sync failed') + '</p>';
+                return;
+            }
+            window._syncLoaded = true;
+            const meta = data.metadata;
+            const stmtBox = document.getElementById('syncStatements');
+            const batchBox = document.getElementById('syncBatches');
+            stmtBox.innerHTML = '';
+            batchBox.innerHTML = '';
+
+            if (meta.statements.length === 0) {
+                stmtBox.innerHTML = '<p style="color:var(--text-muted);font-size:.82rem;">No PDF statements found.</p>';
+            } else {
+                meta.statements.forEach(s => {
+                    const sizeKB = s.size ? (s.size / 1024).toFixed(1) + ' KB' : '';
+                    stmtBox.innerHTML +=
+                        '<div style="display:flex;align-items:center;gap:10px;padding:8px 12px;border:1px solid var(--border);border-radius:var(--radius-sm);background:var(--surface-alt);font-size:.82rem;">' +
+                        '<i class="bi bi-file-earmark-pdf" style="font-size:1.2rem;color:#EF4444;"></i>' +
+                        '<div style="flex:1;"><strong>' + s.name + '</strong>' +
+                        (sizeKB ? '<span style="color:var(--text-muted);margin-left:8px;">' + sizeKB + '</span>' : '') +
+                        '</div>' +
+                        '<button class="btn btn-sm btn-outline-primary" onclick="stageFile(\'' + entity + '\',\'' + s.id + '\',null)" style="font-size:.75rem;padding:2px 10px;"><i class="bi bi-download"></i> Stage</button>' +
+                        '</div>';
+                });
+            }
+
+            if (meta.receipt_batches.length === 0) {
+                batchBox.innerHTML = '<p style="color:var(--text-muted);font-size:.82rem;">No receipt batches found.</p>';
+            } else {
+                meta.receipt_batches.forEach(b => {
+                    batchBox.innerHTML +=
+                        '<div style="display:flex;align-items:center;gap:10px;padding:8px 12px;border:1px solid var(--border);border-radius:var(--radius-sm);background:var(--surface-alt);font-size:.82rem;">' +
+                        '<i class="bi bi-folder-fill" style="font-size:1.2rem;color:var(--warning);"></i>' +
+                        '<div style="flex:1;"><strong>' + b.name + '</strong></div>' +
+                        '<button class="btn btn-sm btn-outline-primary" onclick="stageFile(\'' + entity + '\',null,\'' + b.id + '\')" style="font-size:.75rem;padding:2px 10px;"><i class="bi bi-download"></i> Stage</button>' +
+                        '</div>';
+                });
+            }
+            document.getElementById('syncResults').style.display = 'block';
+        })
+        .catch(err => {
+            btn.disabled = false;
+            btn.innerHTML = '<i class="bi bi-arrow-clockwise"></i> Refresh';
+            document.getElementById('syncPlaceholder').style.display = 'block';
+            document.getElementById('syncPlaceholder').innerHTML =
+                '<p style="color:var(--danger);font-size:.85rem;">Network error: ' + err + '</p>';
+        });
+    }
+
+    // Stage individual statement or batch
+    function stageFile(entity, stmtId, batchId) {
+        const payload = {};
+        if (stmtId) payload.statement_id = stmtId;
+        if (batchId) payload.batch_folder_id = batchId;
+        fetch('/api/sync/' + entity, {
+            method: 'POST',
+            headers: {'Content-Type': 'application/json'},
+            body: JSON.stringify(payload)
+        })
+        .then(r => r.json())
+        .then(data => {
+            if (data.ok) {
+                alert('Staged successfully!\\n' +
+                    (data.statement ? 'Statement: ' + data.statement + '\\n' : '') +
+                    (data.receipts && data.receipts.length ? 'Receipts: ' + data.receipts.length + ' files' : ''));
+            } else {
+                alert('Staging failed: ' + (data.error || 'Unknown error'));
+            }
+        })
+        .catch(err => alert('Network error: ' + err));
+    }
 
     // File upload feedback
     document.getElementById('receiptInput').addEventListener('change', function() {
