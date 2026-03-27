@@ -34,6 +34,12 @@ def _get_ocr():
     global _ocr_engine
     if _ocr_engine is None:
         from paddleocr import PaddleOCR
+        import paddle
+        _use_gpu = paddle.device.is_compiled_with_cuda() and paddle.device.cuda.device_count() > 0
+        if _use_gpu:
+            print("PaddleOCR: Using GPU (CUDA)", file=sys.stderr, flush=True)
+        else:
+            print("PaddleOCR: Using CPU", file=sys.stderr, flush=True)
         _ocr_engine = PaddleOCR(
             lang="en",
             ocr_version="PP-OCRv4",
@@ -41,6 +47,7 @@ def _get_ocr():
             use_doc_orientation_classify=False,
             use_doc_unwarping=False,
             enable_mkldnn=False,
+            device="gpu" if _use_gpu else "cpu",
         )
     return _ocr_engine
 

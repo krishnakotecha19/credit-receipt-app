@@ -3178,12 +3178,12 @@ HTML_TEMPLATE = """
                         var nameEl = document.createElement("strong");
                         nameEl.textContent = s.name + (sizeKB ? " (" + sizeKB + ")" : "");
                         nameEl.style.flex = "1";
-                        var stageBtn = document.createElement("button");
-                        stageBtn.textContent = "Stage";
-                        stageBtn.style.cssText = "font-size:.75rem;padding:4px 12px;background:linear-gradient(135deg,#10b981,#059669);color:#fff;border:none;border-radius:4px;cursor:pointer;font-weight:600;";
-                        stageBtn.addEventListener("click", function() { _stageFromSP(entity, s.id, "statement", stageBtn, s.name); });
+                        var ocrBtn = document.createElement("button");
+                        ocrBtn.textContent = "Run OCR";
+                        ocrBtn.style.cssText = "font-size:.75rem;padding:4px 12px;background:linear-gradient(135deg,#10b981,#059669);color:#fff;border:none;border-radius:4px;cursor:pointer;font-weight:600;";
+                        ocrBtn.addEventListener("click", function() { _runOCR(entity, s.id, "statement", ocrBtn, s.name); });
                         row.appendChild(nameEl);
-                        row.appendChild(stageBtn);
+                        row.appendChild(ocrBtn);
                         stmtBox.appendChild(row);
                     })(meta.statements[i]);
                 }
@@ -3199,12 +3199,12 @@ HTML_TEMPLATE = """
                         var bname = document.createElement("strong");
                         bname.textContent = b.name;
                         bname.style.flex = "1";
-                        var stageBtn = document.createElement("button");
-                        stageBtn.textContent = "Stage";
-                        stageBtn.style.cssText = "font-size:.75rem;padding:4px 12px;background:linear-gradient(135deg,#10b981,#059669);color:#fff;border:none;border-radius:4px;cursor:pointer;font-weight:600;";
-                        stageBtn.addEventListener("click", function() { _stageFromSP(entity, b.id, "receipt_batch", stageBtn, b.name); });
+                        var ocrBtn = document.createElement("button");
+                        ocrBtn.textContent = "Run OCR";
+                        ocrBtn.style.cssText = "font-size:.75rem;padding:4px 12px;background:linear-gradient(135deg,#10b981,#059669);color:#fff;border:none;border-radius:4px;cursor:pointer;font-weight:600;";
+                        ocrBtn.addEventListener("click", function() { _runOCR(entity, b.id, "receipt_batch", ocrBtn, b.name); });
                         brow.appendChild(bname);
-                        brow.appendChild(stageBtn);
+                        brow.appendChild(ocrBtn);
                         batchBox.appendChild(brow);
                     })(meta.receipt_batches[j]);
                 }
@@ -3219,10 +3219,10 @@ HTML_TEMPLATE = """
         });
     }
 
-    function _stageFromSP(entity, id, type, btnEl, fileName) {
+    function _runOCR(entity, id, type, btnEl, fileName) {
         var origText = btnEl.textContent;
         btnEl.disabled = true;
-        btnEl.textContent = "Downloading...";
+        btnEl.textContent = "Starting...";
         btnEl.style.opacity = "0.6";
 
         var payload = {type: type};
@@ -3232,7 +3232,7 @@ HTML_TEMPLATE = """
             payload.item_id = id;
         }
 
-        fetch("/api/stage/sharepoint/" + encodeURIComponent(entity), {
+        fetch("/api/ocr/sharepoint/" + encodeURIComponent(entity), {
             method: "POST",
             headers: {"Content-Type": "application/json"},
             body: JSON.stringify(payload)
@@ -3240,13 +3240,18 @@ HTML_TEMPLATE = """
         .then(function(r) { return r.json(); })
         .then(function(data) {
             if (data.ok) {
-                // Poll for download completion
-                _pollStaging(type, btnEl, origText, fileName);
+                btnEl.textContent = "Processing...";
+                btnEl.style.background = "#f59e0b";
+                // Close sync panel, show progress bar, poll until done
+                _closeSync();
+                var progSection = document.getElementById("progressSection");
+                if (progSection) progSection.style.display = "block";
+                _pollUntilDone();
             } else {
                 btnEl.disabled = false;
                 btnEl.textContent = origText;
                 btnEl.style.opacity = "1";
-                alert("Stage failed: " + (data.error || "Unknown error"));
+                alert("Failed: " + (data.error || "Unknown error"));
             }
         })
         .catch(function(err) {
@@ -3257,39 +3262,30 @@ HTML_TEMPLATE = """
         });
     }
 
-    function _pollStaging(type, btnEl, origText, fileName) {
-        fetch("/api/stage/status")
+    function _pollUntilDone() {
+        fetch("/progress")
         .then(function(r) { return r.json(); })
-        .then(function(s) {
-            if (s.status === "downloading") {
-                btnEl.textContent = s.detail || "Downloading...";
-                setTimeout(function() { _pollStaging(type, btnEl, origText, fileName); }, 800);
-            } else if (s.status === "done") {
-                btnEl.textContent = "Staged!";
-                btnEl.style.background = "#059669";
-                btnEl.style.opacity = "1";
-                // Update sidebar drop zones
-                if (type === "statement") {
-                    var stmtBadge = document.getElementById("stmtBadge");
-                    var stmtZone = document.getElementById("stmtZone");
-                    if (stmtBadge) stmtBadge.innerHTML = '<span class="file-badge" style="color:var(--success);"><i class="bi bi-cloud-check-fill"></i> ' + (s.filename || fileName || "PDF") + '</span>';
-                    if (stmtZone) stmtZone.style.borderColor = "var(--success)";
-                } else if (type === "receipt_batch") {
-                    var rcptBadge = document.getElementById("receiptBadge");
-                    var rcptZone = document.getElementById("receiptZone");
-                    if (rcptBadge) rcptBadge.innerHTML = '<span class="file-badge" style="color:var(--success);"><i class="bi bi-cloud-check-fill"></i> ' + (s.count || "?") + ' receipt(s) staged</span>';
-                    if (rcptZone) rcptZone.style.borderColor = "var(--success)";
-                }
+        .then(function(data) {
+            var stepEl = document.getElementById("stepName");
+            var pctEl = document.getElementById("stepPct");
+            var bar = document.getElementById("progressBar");
+            var detail = document.getElementById("progressDetail");
+            var track = document.getElementById("progressTrack");
+            if (stepEl) stepEl.innerHTML = '<span class="detail-spinner"></span> ' + (data.step || "Processing...");
+            if (pctEl) pctEl.textContent = data.pct + "%";
+            if (bar) bar.style.width = data.pct + "%";
+            if (detail) detail.textContent = data.detail || "Working...";
+            if (track) {
+                if (data.pct === 0) track.classList.add("indeterminate");
+                else track.classList.remove("indeterminate");
+            }
+            if (data.processing) {
+                setTimeout(_pollUntilDone, 1000);
             } else {
-                btnEl.disabled = false;
-                btnEl.textContent = origText;
-                btnEl.style.opacity = "1";
-                alert("Stage failed: " + (s.error || "Unknown error"));
+                location.reload();
             }
         })
-        .catch(function() {
-            setTimeout(function() { _pollStaging(type, btnEl, origText, fileName); }, 1500);
-        });
+        .catch(function() { setTimeout(_pollUntilDone, 2000); });
     }
 })();
 </script>
@@ -3652,15 +3648,15 @@ def api_sync_entity(entity):
         return jsonify({"ok": False, "error": str(e)}), 500
 
 
-@app.route("/api/stage/sharepoint/<path:entity>", methods=["POST"])
-def api_stage_sharepoint(entity):
-    """Download files from SharePoint and save to uploads/ folders.
+@app.route("/api/ocr/sharepoint/<path:entity>", methods=["POST"])
+def api_ocr_sharepoint(entity):
+    """Download from SharePoint + run OCR in background thread.
 
-    Statement PDF  → uploads/statements/<name>.pdf
-    Receipt batch  → uploads/receipts/<image1>.jpg, <image2>.png, ...
-
-    Does NOT run OCR — user clicks Process button after staging.
+    Returns immediately. JS polls /progress until done, then reloads.
     """
+    if _app_state.get("processing"):
+        return jsonify({"ok": False, "error": "Processing already in progress"}), 409
+
     mapped = _ENTITY_SYNC_MAP.get(entity.strip().lower())
     if not mapped:
         return jsonify({"ok": False, "error": f"Unknown entity '{entity}'"}), 400
@@ -3673,183 +3669,176 @@ def api_stage_sharepoint(entity):
     if not item_id and not folder_id:
         return jsonify({"ok": False, "error": "item_id or folder_id required"}), 400
 
-    # Launch download in background thread — return immediately
-    _app_state["_staging"] = {"status": "downloading", "type": item_type, "detail": "Connecting to SharePoint..."}
+    # Mark processing started and launch background thread
+    _app_state["processing"] = True
+    _app_state["progress"] = {"step": "Downloading", "pct": 0, "detail": "Connecting to SharePoint..."}
+    _app_state["log_lines"] = []
 
     t = threading.Thread(
-        target=_bg_stage_from_sharepoint,
+        target=_bg_download_and_ocr,
         args=(mapped, item_type, item_id, folder_id),
         daemon=True,
     )
     t.start()
-    return jsonify({"ok": True, "status": "downloading"})
+    return jsonify({"ok": True, "status": "started"})
 
 
-@app.route("/api/stage/status")
-def api_stage_status():
-    """Poll staging progress."""
-    staging = _app_state.get("_staging", {})
-    return jsonify(staging)
+def _bg_download_and_ocr(entity_key, item_type, item_id, folder_id):
+    """Background thread: download from SharePoint → save to uploads/ → run OCR."""
 
+    def log(msg):
+        _app_state["log_lines"].append(msg)
 
-def _bg_stage_from_sharepoint(entity_key, item_type, item_id, folder_id):
-    """Background thread: download from SharePoint and save to uploads/."""
-    staging = _app_state["_staging"]
+    def set_progress(step, pct, detail=""):
+        _app_state["progress"] = {"step": step, "pct": pct, "detail": detail}
+
     try:
         sp = SharePointManager(entity=entity_key)
         if not sp.is_authenticated:
-            staging.update({"status": "error", "error": "SharePoint auth failed"})
+            log("ERROR: SharePoint auth failed")
+            set_progress("Done", 100, "SharePoint auth failed")
+            _app_state["processing"] = False
             return
 
         if item_type == "statement" and item_id:
-            staging["detail"] = "Downloading statement PDF..."
+            # ── Download statement PDF ──
+            set_progress("Downloading", 2, "Downloading statement PDF...")
+            log("Downloading statement from SharePoint...")
             result = sp.get_file_content(item_id)
             if not result["ok"]:
-                staging.update({"status": "error", "error": result.get("error", "Download failed")})
+                log(f"ERROR: {result.get('error')}")
+                set_progress("Done", 100, result.get("error", "Download failed"))
+                _app_state["processing"] = False
                 return
-            dest = UPLOAD_DIR_STATEMENTS / result["name"]
+
+            filename = result["name"]
+            dest = UPLOAD_DIR_STATEMENTS / filename
             dest.write_bytes(result["bytes"])
-            staging.update({"status": "done", "filename": result["name"],
-                            "size": len(result["bytes"])})
+            del result  # free memory
+            log(f"Downloaded: {filename}")
+
+            # ── Check cache ──
+            cached_df = _load_stmt_cache(filename)
+            if cached_df is not None:
+                _app_state["df_statements"] = cached_df
+                log(f"Loaded from cache: {len(cached_df)} transactions")
+                set_progress("Matching", 80, "Matching...")
+                _try_rematch()
+                set_progress("Done", 100, f"Cached: {len(cached_df)} transactions")
+                log("Processing complete!")
+                _save_state()
+                _app_state["processing"] = False
+                return
+
+            # ── Run OCR ──
+            set_progress("Statements", 10, f"Running OCR on {filename}...")
+            log(f"Running statement OCR on {filename}...")
+            pages = process_statement_pdf(str(dest))
+            n_words = sum(len(p.get("raw_ocr_words", [])) for p in pages)
+            log(f"OCR done: {len(pages)} page(s), {n_words} words")
+
+            _app_state["debug_stmt_ocr_words"] = [
+                {"page": p["page_number"], "status": p.get("status", ""),
+                 "words": p.get("raw_ocr_words", [])}
+                for p in pages
+            ]
+
+            set_progress("Statements", 40, "Building rows...")
+            raw_rows, confs = _build_raw_text_rows(pages)
+            _app_state["debug_stmt_raw_rows"] = raw_rows
+            log(f"Built {len(raw_rows)} raw row(s)")
+
+            if raw_rows:
+                set_progress("Statements", 55, "Parsing rows...")
+                parsed = _parse_rows_columnar(raw_rows)
+                log(f"Parsed {len(parsed)} transaction(s)")
+
+                set_progress("Statements", 70, "Validating...")
+                df_stmts = _validate_transactions(parsed, confs, raw_rows)
+                _app_state["df_statements"] = df_stmts
+                _save_stmt_cache(filename, df_stmts)
+                log(f"Validated {len(df_stmts)} transaction(s)")
+
+                set_progress("Matching", 85, "Matching...")
+                _try_rematch()
+            else:
+                log("No rows reconstructed from statement.")
+
+            set_progress("Done", 100, "Complete!")
+            log("Processing complete!")
 
         elif item_type == "receipt_batch" and folder_id:
-            staging["detail"] = "Listing folder contents..."
+            # ── Download all receipt images ──
+            set_progress("Downloading", 2, "Listing receipt folder...")
+            log("Downloading receipts from SharePoint...")
             folder_result = sp.get_folder_files(folder_id)
             if not folder_result["ok"]:
-                staging.update({"status": "error", "error": folder_result.get("error", "Folder failed")})
+                log(f"ERROR: {folder_result.get('error')}")
+                set_progress("Done", 100, folder_result.get("error", "Download failed"))
+                _app_state["processing"] = False
                 return
+
             files = folder_result["files"]
             if not files:
-                staging.update({"status": "error", "error": "No image files in folder"})
+                log("No image files in folder")
+                set_progress("Done", 100, "No image files found")
+                _app_state["processing"] = False
                 return
-            saved = []
+
+            receipt_paths = []
             for i, f in enumerate(files):
-                staging["detail"] = f"Downloading {i+1}/{len(files)}: {f['name']}"
+                set_progress("Downloading", max(2, int(2 + (i / len(files)) * 18)),
+                             f"Downloading {i+1}/{len(files)}: {f['name']}")
                 dest = UPLOAD_DIR_RECEIPTS / f["name"]
                 dest.write_bytes(f["bytes"])
-                saved.append(f["name"])
-            staging.update({"status": "done", "count": len(saved), "files": saved})
+                receipt_paths.append(str(dest))
+            del folder_result, files  # free memory
+            log(f"Downloaded {len(receipt_paths)} receipt(s)")
 
-    except Exception as e:
-        staging.update({"status": "error", "error": str(e)})
+            # ── Run OCR ──
+            set_progress("Receipts", 22, f"Processing {len(receipt_paths)} receipt(s)...")
+            log(f"Running receipt OCR on {len(receipt_paths)} file(s)...")
 
+            def _cb(done, total):
+                pct = max(22, int(22 + (done / total) * 53))
+                set_progress("Receipts", pct, f"Receipt {done}/{total}")
 
-def _bg_ocr_statement_bytes(pdf_bytes, filename):
-    """Background thread: run statement OCR from bytes (zero disk I/O)."""
-    _app_state["processing"] = True
-    _app_state["log_lines"] = []
+            results = extract_receipts_batch(receipt_paths, progress_callback=_cb)
 
-    def log(msg):
-        _app_state["log_lines"].append(msg)
+            n_ok = sum(1 for r in results if r.get("status") == "success")
+            log(f"Receipts done: {n_ok} success, {len(results) - n_ok} failed")
 
-    def set_progress(step, pct, detail=""):
-        _app_state["progress"] = {"step": step, "pct": pct, "detail": detail}
+            # Store debug info
+            debug = _app_state.get("debug_receipt_ocr", {})
+            for d in results:
+                debug[d.get("receipt_file", "")] = {
+                    "raw_text": d.get("raw_text", ""),
+                    "vendor": d.get("vendor"),
+                    "amount": d.get("amount"),
+                    "date": d.get("date"),
+                    "confidence": d.get("confidence", 0.0),
+                    "status": d.get("status", "failed"),
+                }
+            _app_state["debug_receipt_ocr"] = debug
 
-    try:
-        set_progress("Statements", 5, f"Running OCR on {filename}...")
-        log(f"OCR on SharePoint file: {filename} (memory stream)")
-
-        pages = process_statement_pdf_bytes(pdf_bytes)
-        n_words = sum(len(p.get("raw_ocr_words", [])) for p in pages)
-        log(f"OCR done: {len(pages)} page(s), {n_words} words")
-
-        _app_state["debug_stmt_ocr_words"] = [
-            {"page": p["page_number"], "status": p.get("status", ""),
-             "words": p.get("raw_ocr_words", [])}
-            for p in pages
-        ]
-
-        set_progress("Statements", 36, "Building rows...")
-        raw_rows, confs = _build_raw_text_rows(pages)
-        _app_state["debug_stmt_raw_rows"] = raw_rows
-        log(f"Built {len(raw_rows)} raw row(s)")
-
-        if raw_rows:
-            set_progress("Statements", 50, "Parsing rows...")
-            parsed = _parse_rows_columnar(raw_rows)
-            log(f"Parsed {len(parsed)} transaction(s)")
-
-            set_progress("Statements", 65, "Validating...")
-            df_stmts = _validate_transactions(parsed, confs, raw_rows)
-            _app_state["df_statements"] = df_stmts
-            _save_stmt_cache(filename, df_stmts)
-            log(f"Validated {len(df_stmts)} transaction(s)")
+            df_new = pd.DataFrame(results)
+            existing = _app_state.get("df_receipts")
+            if existing is not None and not existing.empty:
+                df_new = pd.concat([existing, df_new]).drop_duplicates(
+                    subset="receipt_file", keep="last"
+                ).reset_index(drop=True)
+            _app_state["df_receipts"] = df_new
 
             set_progress("Matching", 80, "Matching...")
             _try_rematch()
-        else:
-            log("No rows reconstructed from statement.")
 
-        set_progress("Done", 100, "Complete!")
-        log("Processing complete!")
+            set_progress("Done", 100, f"{n_ok} receipts processed")
+            log("Processing complete!")
+
     except Exception as e:
         log(f"ERROR: {e}")
         set_progress("Done", 100, f"Error: {e}")
     finally:
-        del pdf_bytes
-        gc.collect()
-        _save_state()
-        _app_state["processing"] = False
-
-
-def _bg_ocr_receipts_bytes(file_list):
-    """Background thread: run receipt OCR from bytes (zero disk I/O).
-    file_list: [{"name": ..., "bytes": ...}, ...]"""
-    _app_state["processing"] = True
-    _app_state["log_lines"] = []
-
-    def log(msg):
-        _app_state["log_lines"].append(msg)
-
-    def set_progress(step, pct, detail=""):
-        _app_state["progress"] = {"step": step, "pct": pct, "detail": detail}
-
-    try:
-        set_progress("Receipts", 5, f"Processing {len(file_list)} receipt(s)...")
-        log(f"OCR on {len(file_list)} receipt(s) from SharePoint (memory stream)")
-
-        def _cb(done, total):
-            local_pct = done / total
-            global_pct = max(5, int(5 + local_pct * 60))
-            set_progress("Receipts", global_pct, f"Receipt {done}/{total}")
-
-        results = extract_receipts_batch_bytes(file_list, progress_callback=_cb)
-
-        n_ok = sum(1 for r in results if r.get("status") == "success")
-        log(f"Receipts done: {n_ok} success, {len(results) - n_ok} failed")
-
-        # Store debug info
-        debug = _app_state.get("debug_receipt_ocr", {})
-        for d in results:
-            debug[d.get("receipt_file", "")] = {
-                "raw_text": d.get("raw_text", ""),
-                "vendor": d.get("vendor"),
-                "amount": d.get("amount"),
-                "date": d.get("date"),
-                "confidence": d.get("confidence", 0.0),
-                "status": d.get("status", "failed"),
-            }
-        _app_state["debug_receipt_ocr"] = debug
-
-        # Merge into existing receipts
-        df_new = pd.DataFrame(results)
-        existing = _app_state.get("df_receipts")
-        if existing is not None and not existing.empty:
-            df_new = pd.concat([existing, df_new]).drop_duplicates(
-                subset="receipt_file", keep="last"
-            ).reset_index(drop=True)
-        _app_state["df_receipts"] = df_new
-
-        set_progress("Matching", 75, "Matching...")
-        _try_rematch()
-
-        set_progress("Done", 100, f"{n_ok} receipts processed")
-        log("Processing complete!")
-    except Exception as e:
-        log(f"ERROR: {e}")
-        set_progress("Done", 100, f"Error: {e}")
-    finally:
-        del file_list
         gc.collect()
         _save_state()
         _app_state["processing"] = False

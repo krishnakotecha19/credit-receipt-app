@@ -76,8 +76,16 @@ def _get_doctr():
     global _doctr_engine
     if _doctr_engine is None:
         print("Loading DocTR model (first run may download weights)...", file=sys.stderr, flush=True)
+        import torch
+        _use_gpu = torch.cuda.is_available()
+        if _use_gpu:
+            print(f"DocTR: Using GPU ({torch.cuda.get_device_name(0)})", file=sys.stderr, flush=True)
+        else:
+            print("DocTR: Using CPU", file=sys.stderr, flush=True)
         from doctr.models import ocr_predictor
-        _doctr_engine = ocr_predictor(pretrained=True)
+        _doctr_engine = ocr_predictor(pretrained=True).to(
+            torch.device("cuda" if _use_gpu else "cpu")
+        )
         print("DocTR model loaded.", file=sys.stderr, flush=True)
     return _doctr_engine
 
