@@ -110,6 +110,7 @@ SI2TECH_MAP = {
 ENTITY_OPTIONS = ["Si2Tech", "Vcare Global"]
 ENTITY_COST_MAP = {"Si2Tech": SI2TECH_MAP, "Vcare Global": VCARE_MAP}
 APPROVED_BY_OPTIONS = ["", "Admin"]
+CREDIT_CARD_BANK_OPTIONS = ["", "HDFC"]
 
 # ---------------------------------------------------------------------------
 # Flask App
@@ -126,7 +127,10 @@ _app_state = {
     "df_statements": None,
     "df_matches": None,
     "debug_receipt_ocr": {},
+    "debug_stmt_ocr_words": [],   # raw OCR words list per page from DocTR
+    "debug_stmt_raw_rows": [],    # pipe-separated rows after row reconstruction
     "selected_entity": "Si2Tech",
+    "credit_card_bank": "",
     "processing": False,
     "progress": {"step": "", "pct": 0, "detail": ""},
     "log_lines": [],
@@ -145,6 +149,7 @@ def _save_state():
         if df is not None and isinstance(df, pd.DataFrame) and not df.empty:
             cache[key] = df.to_json(orient="records", date_format="iso")
     cache["selected_entity"] = _app_state.get("selected_entity", "Si2Tech")
+    cache["credit_card_bank"] = _app_state.get("credit_card_bank", "")
     cache["debug_receipt_ocr"] = _app_state.get("debug_receipt_ocr", {})
     _SESSION_CACHE_FILE.write_text(json.dumps(cache, indent=2), encoding="utf-8")
 
@@ -165,6 +170,7 @@ def _restore_state():
             except Exception:
                 pass
     _app_state["selected_entity"] = cache.get("selected_entity", "Si2Tech")
+    _app_state["credit_card_bank"] = cache.get("credit_card_bank", "")
     _app_state["debug_receipt_ocr"] = cache.get("debug_receipt_ocr", {})
 
 
@@ -341,19 +347,38 @@ _DATE_RE = re.compile(
 
 
 def _strip_bogus_rupee_2(amt_str, desc):
-    """Strip leading '2' when DocTR misreads the ₹ symbol as digit 2.
+    """Strip bogus leading digit when DocTR misreads the ₹ symbol.
 
-    CRITICAL: The amount is the most important field — NEVER strip '2' unless
-    the evidence is unambiguous.  All heuristics require BOTH a structural
-    amount pattern AND a description keyword signal."""
+    ₹ is misread as 2, 7, 8, R, B, etc. — this function removes it.
+
+    CRITICAL: The amount is the most important field — NEVER strip unless
+    the evidence is unambiguous (structural impossibility or keyword signal)."""
     prefix = ""
     if amt_str.startswith('+') or amt_str.startswith('-'):
         prefix = amt_str[0]
         amt_str = amt_str[1:]
-    if not amt_str.startswith('2'):
-        return prefix + amt_str
+    if not amt_str:
+        return prefix
 
     desc_lower = desc.lower()
+
+    # ── Universal rule: no-comma 4-digit integer is ALWAYS a ₹ artifact ──────
+    # Indian bank statements ALWAYS format amounts ≥ 1,000 with a comma.
+    # So "7367.00" (4 integer digits, no comma) is structurally impossible.
+    # The leading digit is the ₹ glyph — strip it unconditionally.
+    # Covers ALL digit variants: 7367→367, 2367→367, 8367→367, etc.
+    _nc4 = re.match(r'^(\d)(\d{3}\.\d{2})$', amt_str)
+    if _nc4:
+        return prefix + _nc4.group(2)
+
+    # 5-digit no-comma: e.g. "71234.00" → strip leading digit → "1234.00"
+    _nc5 = re.match(r'^(\d)(\d{4}\.\d{2})$', amt_str)
+    if _nc5:
+        return prefix + _nc5.group(2)
+
+    # Only rules below apply to '2'-prefixed amounts
+    if not amt_str.startswith('2'):
+        return prefix + amt_str
 
     # 1. Comma violation: 2XX,XXX.XX → XX,XXX.XX
     if re.match(r'^2\d{2},\d{3}\.\d{2}$', amt_str):
@@ -383,6 +408,10 @@ def _strip_bogus_rupee_2(amt_str, desc):
         return prefix + '5,059.00'
 
     return prefix + amt_str
+
+# Backward-compat alias
+_strip_bogus_rupee_prefix = _strip_bogus_rupee_2
+
 
 
 def _build_raw_text_rows(ocr_pages):
@@ -933,36 +962,40 @@ def _match_transactions(df_receipts, df_statements):
             status = ("auto_approved" if best_score > 90
                       else "review" if best_score >= 50
                       else "unmatched")
+            credit_card_bank = _app_state.get("credit_card_bank", "")
             matches.append({
-                "receipt_file": receipt.get("receipt_file", ""),
-                "receipt_vendor": r_vendor,
-                "receipt_amount": r_amount,
-                "receipt_date": r_date_str,
-                "stmt_description": stmt_row.get("description", ""),
-                "stmt_amount": stmt_row.get("amount"),
-                "stmt_date": stmt_row.get("date", ""),
-                "match_score": best_score,
-                "status": status,
-                "entity": entity,
-                "cost_centre": "",
-                "gl_code": "",
-                "approved_by": "",
+                "Receipt File": receipt.get("receipt_file", ""),
+                "Receipt Vendor": r_vendor,
+                "Receipt Amount": r_amount,
+                "Receipt Date": r_date_str,
+                "Statement Description": stmt_row.get("description", ""),
+                "Statement Amount": stmt_row.get("amount"),
+                "Statement Date": stmt_row.get("date", ""),
+                "Match Score": best_score,
+                "Status": status,
+                "Entity": entity,
+                "Credit Card Bank": credit_card_bank,
+                "Cost Centre": "",
+                "GL Code": "",
+                "Approved By": "",
             })
         else:
+            credit_card_bank = _app_state.get("credit_card_bank", "")
             matches.append({
-                "receipt_file": receipt.get("receipt_file", ""),
-                "receipt_vendor": r_vendor,
-                "receipt_amount": r_amount,
-                "receipt_date": r_date_str,
-                "stmt_description": "",
-                "stmt_amount": None,
-                "stmt_date": "",
-                "match_score": 0,
-                "status": "unmatched",
-                "entity": entity,
-                "cost_centre": "",
-                "gl_code": "",
-                "approved_by": "",
+                "Receipt File": receipt.get("receipt_file", ""),
+                "Receipt Vendor": r_vendor,
+                "Receipt Amount": r_amount,
+                "Receipt Date": r_date_str,
+                "Statement Description": "",
+                "Statement Amount": None,
+                "Statement Date": "",
+                "Match Score": 0,
+                "Status": "unmatched",
+                "Entity": entity,
+                "Credit Card Bank": credit_card_bank,
+                "Cost Centre": "",
+                "GL Code": "",
+                "Approved By": "",
             })
 
     return pd.DataFrame(matches)
@@ -972,7 +1005,12 @@ def _match_transactions(df_receipts, df_statements):
 # Background processing thread
 # ---------------------------------------------------------------------------
 def _run_processing(receipt_paths, statement_path, entity):
-    """Run the full pipeline in a background thread."""
+    """Run the full pipeline in a background thread.
+
+    IMPORTANT: Each step (receipts, statements, matching) is wrapped in its
+    own try/except so that a failure in one step NEVER prevents the other
+    steps from running.
+    """
     _app_state["processing"] = True
     _app_state["log_lines"] = []
     _app_state["selected_entity"] = entity
@@ -983,9 +1021,9 @@ def _run_processing(receipt_paths, statement_path, entity):
     def set_progress(step, pct, detail=""):
         _app_state["progress"] = {"step": step, "pct": pct, "detail": detail}
 
-    try:
-        # Step 1: Receipts
-        if receipt_paths:
+    # ── Step 1: Receipts ─────────────────────────────────────────────────
+    if receipt_paths:
+        try:
             set_progress("Receipts", 0, "Processing receipts...")
             log(f"Processing {len(receipt_paths)} receipt(s)...")
 
@@ -998,7 +1036,7 @@ def _run_processing(receipt_paths, statement_path, entity):
             n_fail = len(results) - n_ok
             log(f"Receipts done: {n_ok} success, {n_fail} failed")
 
-            debug = _app_state.get("debug_receipt_ocr", {})
+            debug = {}
             for data in results:
                 debug[data.get("receipt_file", "")] = {
                     "raw_text": data.get("raw_text", ""),
@@ -1011,15 +1049,15 @@ def _run_processing(receipt_paths, statement_path, entity):
             _app_state["debug_receipt_ocr"] = debug
 
             df_new = pd.DataFrame(results)
-            if _app_state.get("df_receipts") is not None:
-                existing = _app_state["df_receipts"]
-                df_new = pd.concat([existing, df_new]).drop_duplicates(
-                    subset="receipt_file", keep="last").reset_index(drop=True)
             _app_state["df_receipts"] = df_new
             gc.collect()
+        except Exception as e:
+            log(f"ERROR in receipt processing: {e}")
+            # Continue to statement processing regardless
 
-        # Step 2: Statements
-        if statement_path:
+    # ── Step 2: Statements ───────────────────────────────────────────────
+    if statement_path:
+        try:
             set_progress("Statements", 0, "OCR on statement...")
             log("Running DocTR OCR on statement...")
 
@@ -1034,9 +1072,22 @@ def _run_processing(receipt_paths, statement_path, entity):
                 n_words = sum(len(p.get("raw_ocr_words", [])) for p in pages)
                 log(f"OCR done: {len(pages)} page(s), {n_words} words")
 
+                # Store raw OCR words for Debug tab
+                _app_state["debug_stmt_ocr_words"] = [
+                    {
+                        "page": p["page_number"],
+                        "status": p.get("status", ""),
+                        "words": p.get("raw_ocr_words", []),
+                    }
+                    for p in pages
+                ]
+
                 set_progress("Statements", 40, "Building rows...")
                 raw_rows, confs = _build_raw_text_rows(pages)
                 log(f"Built {len(raw_rows)} raw row(s)")
+
+                # Store reconstructed rows for Debug tab
+                _app_state["debug_stmt_raw_rows"] = raw_rows
 
                 if raw_rows:
                     set_progress("Statements", 60, "Parsing rows...")
@@ -1051,32 +1102,39 @@ def _run_processing(receipt_paths, statement_path, entity):
                 else:
                     log("No rows reconstructed from statement.")
                 gc.collect()
+        except Exception as e:
+            log(f"ERROR in statement processing: {e}")
+            # Continue to matching regardless
 
-        # Step 3: Matching
-        if _app_state.get("df_receipts") is not None and _app_state.get("df_statements") is not None:
+    # ── Step 3: Matching ─────────────────────────────────────────────────
+    if _app_state.get("df_receipts") is not None and _app_state.get("df_statements") is not None:
+        try:
             set_progress("Matching", 0, "Matching receipts to transactions...")
             log("Matching receipts to transactions...")
             df_matches = _match_transactions(
                 _app_state["df_receipts"], _app_state["df_statements"])
             _app_state["df_matches"] = df_matches
-            n_auto = len(df_matches[df_matches["status"] == "auto_approved"])
-            n_review = len(df_matches[df_matches["status"] == "review"])
-            n_un = len(df_matches[df_matches["match_score"] == 0])
+            n_auto = len(df_matches[df_matches["Status"] == "auto_approved"])
+            n_review = len(df_matches[df_matches["Status"] == "review"])
+            n_un = len(df_matches[df_matches["Match Score"] == 0])
             log(f"Matching done: {n_auto} auto-approved, {n_review} review, {n_un} unmatched")
             set_progress("Done", 100, f"{n_auto} approved, {n_review} review, {n_un} unmatched")
+        except Exception as e:
+            log(f"ERROR in matching: {e}")
 
+    try:
         _save_state()
-        log("Processing complete!")
-
-    except Exception as e:
-        log(f"ERROR: {e}")
-        set_progress("Error", 0, str(e))
-    finally:
-        _app_state["processing"] = False
+    except Exception:
+        pass
+    log("Processing complete!")
+    _app_state["processing"] = False
 
 
 def _run_processing_online(receipt_paths, statement_path, entity):
-    """Run the ONLINE pipeline (HF Inference API) in a background thread."""
+    """Run the ONLINE pipeline (HF Inference API) in a background thread.
+
+    Each step is isolated with its own try/except so failures don't cascade.
+    """
     _app_state["processing"] = True
     _app_state["log_lines"] = []
     _app_state["selected_entity"] = entity
@@ -1087,16 +1145,17 @@ def _run_processing_online(receipt_paths, statement_path, entity):
     def set_progress(step, pct, detail=""):
         _app_state["progress"] = {"step": step, "pct": pct, "detail": detail}
 
-    try:
-        # Check HF API key
-        hf_key = os.environ.get("HF_API_KEY", "")
-        if not hf_key:
-            log("ERROR: HF_API_KEY not set in .env — cannot run online pipeline.")
-            set_progress("Error", 0, "HF_API_KEY not set")
-            return
+    # Check HF API key
+    hf_key = os.environ.get("HF_API_KEY", "")
+    if not hf_key:
+        log("ERROR: HF_API_KEY not set in .env — cannot run online pipeline.")
+        set_progress("Error", 0, "HF_API_KEY not set")
+        _app_state["processing"] = False
+        return
 
-        # Step 1: Receipts via HF Qwen2.5-VL
-        if receipt_paths:
+    # ── Step 1: Receipts via HF Qwen2.5-VL ────────────────────────────
+    if receipt_paths:
+        try:
             set_progress("Receipts (Online)", 0, "Processing receipts via HF VLM...")
             log(f"[Online] Processing {len(receipt_paths)} receipt(s) via HF Qwen2.5-VL...")
 
@@ -1109,7 +1168,7 @@ def _run_processing_online(receipt_paths, statement_path, entity):
             n_fail = len(results) - n_ok
             log(f"[Online] Receipts done: {n_ok} success, {n_fail} failed")
 
-            debug = _app_state.get("debug_receipt_ocr", {})
+            debug = {}
             for data in results:
                 debug[data.get("receipt_file", "")] = {
                     "raw_text": data.get("raw_text", ""),
@@ -1122,19 +1181,18 @@ def _run_processing_online(receipt_paths, statement_path, entity):
             _app_state["debug_receipt_ocr"] = debug
 
             df_new = pd.DataFrame(results)
-            if _app_state.get("df_receipts") is not None:
-                existing = _app_state["df_receipts"]
-                df_new = pd.concat([existing, df_new]).drop_duplicates(
-                    subset="receipt_file", keep="last").reset_index(drop=True)
             _app_state["df_receipts"] = df_new
             gc.collect()
-        elif _app_state.get("df_receipts") is not None:
-            log("[Online] No new receipts. Using previously processed data.")
-        else:
-            log("[Online] No receipt images found.")
+        except Exception as e:
+            log(f"ERROR in online receipt processing: {e}")
+    elif _app_state.get("df_receipts") is not None:
+        log("[Online] No new receipts. Using previously processed data.")
+    else:
+        log("[Online] No receipt images found.")
 
-        # Step 2: Statements — send page images directly to VLM
-        if statement_path:
+    # ── Step 2: Statements — send page images directly to VLM ─────────
+    if statement_path:
+        try:
             stmt_name = os.path.basename(statement_path)
 
             # Check cache first
@@ -1172,32 +1230,35 @@ def _run_processing_online(receipt_paths, statement_path, entity):
                     gc.collect()
                 else:
                     log("[Online] VLM returned no transactions from statement.")
-        elif _app_state.get("df_statements") is not None:
-            log("[Online] No new statements. Using previously processed data.")
-        else:
-            log("[Online] No statements uploaded. Skipping statement step.")
+        except Exception as e:
+            log(f"ERROR in online statement processing: {e}")
+    elif _app_state.get("df_statements") is not None:
+        log("[Online] No new statements. Using previously processed data.")
+    else:
+        log("[Online] No statements uploaded. Skipping statement step.")
 
-        # Step 3: Match (same as offline)
-        if _app_state.get("df_receipts") is not None and _app_state.get("df_statements") is not None:
+    # ── Step 3: Match (same as offline) ──────────────────────────────
+    if _app_state.get("df_receipts") is not None and _app_state.get("df_statements") is not None:
+        try:
             set_progress("Matching (Online)", 90, "[Online] Step 3 — Matching...")
             log("[Online] Step 3 — Matching receipts to transactions...")
             df_matches = _match_transactions(
                 _app_state["df_receipts"], _app_state["df_statements"])
             _app_state["df_matches"] = df_matches
-            n_auto = len(df_matches[df_matches["status"] == "auto_approved"])
-            n_review = len(df_matches[df_matches["status"] == "review"])
-            n_un = len(df_matches[df_matches["match_score"] == 0])
+            n_auto = len(df_matches[df_matches["Status"] == "auto_approved"])
+            n_review = len(df_matches[df_matches["Status"] == "review"])
+            n_un = len(df_matches[df_matches["Match Score"] == 0])
             log(f"[Online] Step 3 done — {n_auto} auto, {n_review} review, {n_un} unmatched")
             set_progress("Done", 100, f"{n_auto} approved, {n_review} review, {n_un} unmatched")
+        except Exception as e:
+            log(f"ERROR in online matching: {e}")
 
+    try:
         _save_state()
-        log("[Online] Processing complete!")
-
-    except Exception as e:
-        log(f"ERROR: {e}")
-        set_progress("Error", 0, str(e))
-    finally:
-        _app_state["processing"] = False
+    except Exception:
+        pass
+    log("[Online] Processing complete!")
+    _app_state["processing"] = False
 
 
 # ---------------------------------------------------------------------------
@@ -1765,6 +1826,40 @@ HTML_TEMPLATE = """
         }
         @keyframes spin { to { transform: rotate(360deg); } }
 
+        /* ── Receipt Thumbnail in Table ── */
+        .receipt-thumb {
+            width: 56px;
+            height: 56px;
+            object-fit: cover;
+            border-radius: 6px;
+            border: 1px solid var(--border);
+            cursor: pointer;
+            transition: transform 0.2s, box-shadow 0.2s;
+        }
+        .receipt-thumb:hover {
+            transform: scale(1.15);
+            box-shadow: var(--shadow-md);
+        }
+        .receipt-modal-overlay {
+            display: none;
+            position: fixed;
+            inset: 0;
+            background: rgba(0,0,0,0.7);
+            z-index: 300;
+            align-items: center;
+            justify-content: center;
+            cursor: zoom-out;
+        }
+        .receipt-modal-overlay.active {
+            display: flex;
+        }
+        .receipt-modal-overlay img {
+            max-width: 90vw;
+            max-height: 90vh;
+            border-radius: var(--radius);
+            box-shadow: 0 10px 40px rgba(0,0,0,0.4);
+        }
+
         /* ── Responsive ── */
         @media (max-width: 1024px) {
             .app-layout { grid-template-columns: 1fr; }
@@ -1843,6 +1938,13 @@ HTML_TEMPLATE = """
             <select name="entity" class="form-select" style="width:100%; margin-bottom: 1rem;">
                 {% for e in entities %}
                 <option value="{{ e }}" {{ 'selected' if e == entity else '' }}>{{ e }}</option>
+                {% endfor %}
+            </select>
+
+            <h6><i class="bi bi-credit-card"></i> Credit Card Bank</h6>
+            <select name="credit_card_bank" class="form-select" style="width:100%; margin-bottom: 1rem;">
+                {% for cb in credit_card_bank_options %}
+                <option value="{{ cb }}" {{ 'selected' if cb == credit_card_bank else '' }}>{{ cb if cb else '— Select —' }}</option>
                 {% endfor %}
             </select>
 
@@ -1932,8 +2034,9 @@ HTML_TEMPLATE = """
                 <i class="bi bi-arrow-down-left-circle"></i> Credits
                 {% if n_credits %}<span class="badge-count">{{ n_credits }}</span>{% endif %}
             </button>
+
             <button class="tab-btn" data-tab="compare">
-                <i class="bi bi-columns-gap"></i> Receipt vs Transaction
+                <i class="bi bi-columns-gap"></i> Receipt vs Statement
             </button>
             <button class="tab-btn" data-tab="debug">
                 <i class="bi bi-bug"></i> Debug
@@ -1956,28 +2059,38 @@ HTML_TEMPLATE = """
                         <table class="data-table">
                             <thead>
                                 <tr>
-                                    <th>Stmt Description</th>
-                                    <th>Stmt Amt</th>
-                                    <th>Stmt Date</th>
+                                    <th>Receipt Image</th>
+                                    <th>Statement Description</th>
+                                    <th>Statement Amount</th>
+                                    <th>Statement Date</th>
                                     <th>Receipt Vendor</th>
-                                    <th>Rcpt Amt</th>
-                                    <th>Rcpt Date</th>
+                                    <th>Receipt Amount</th>
+                                    <th>Receipt Date</th>
                                     <th>Entity</th>
+                                    <th>Credit Card Bank</th>
                                     <th>Cost Centre</th>
                                     <th>GL Code</th>
-                                    <th>Score</th>
+                                    <th>Match Score</th>
                                 </tr>
                             </thead>
                             <tbody>
                                 {% for row in approved_rows %}
                                 <tr>
-                                    <td>{{ row.stmt_description or '—' }}</td>
-                                    <td>{{ '%.2f'|format(row.stmt_amount|float) if row.stmt_amount else '—' }}</td>
-                                    <td>{{ row.stmt_date or '—' }}</td>
+                                    <td>
+                                        {% if row.receipt_file %}
+                                        <img src="/receipt-image/{{ row.receipt_file }}" class="receipt-thumb" alt="{{ row.receipt_file }}" title="{{ row.receipt_file }}" onclick="showReceiptModal(this.src)">
+                                        {% else %}
+                                        <span style="color:var(--text-muted);"><i class="bi bi-image"></i></span>
+                                        {% endif %}
+                                    </td>
+                                    <td>{{ row.statement_description or '—' }}</td>
+                                    <td>{{ '%.2f'|format(row.statement_amount|float) if row.statement_amount else '—' }}</td>
+                                    <td>{{ row.statement_date or '—' }}</td>
                                     <td>{{ row.receipt_vendor or '—' }}</td>
                                     <td>{{ '%.2f'|format(row.receipt_amount|float) if row.receipt_amount else '—' }}</td>
                                     <td>{{ row.receipt_date or '—' }}</td>
                                     <td>{{ row.entity or '—' }}</td>
+                                    <td>{{ row.credit_card_bank or '—' }}</td>
                                     <td>
                                         <select class="form-select form-select-sm cc-select" data-idx="{{ row._idx }}" data-entity="{{ row.entity or entity }}" style="min-width:180px; font-size:0.8rem;">
                                             <option value="">— Select —</option>
@@ -2021,15 +2134,17 @@ HTML_TEMPLATE = """
                             <thead>
                                 <tr>
                                     <th></th>
-                                    <th>Stmt Description</th>
-                                    <th>Stmt Amt</th>
-                                    <th>Stmt Date</th>
+                                    <th>Receipt Image</th>
+                                    <th>Statement Description</th>
+                                    <th>Statement Amount</th>
+                                    <th>Statement Date</th>
                                     <th>Receipt Vendor</th>
-                                    <th>Rcpt Amt</th>
-                                    <th>Rcpt Date</th>
+                                    <th>Receipt Amount</th>
+                                    <th>Receipt Date</th>
+                                    <th>Credit Card Bank</th>
                                     <th>Cost Centre</th>
                                     <th>GL Code</th>
-                                    <th>Score</th>
+                                    <th>Match Score</th>
                                     <th>Action</th>
                                 </tr>
                             </thead>
@@ -2037,12 +2152,20 @@ HTML_TEMPLATE = """
                                 {% for row in review_rows %}
                                 <tr>
                                     <td><input type="checkbox" class="form-check-input review-check" data-idx="{{ row._idx }}"></td>
-                                    <td>{{ row.stmt_description or '—' }}</td>
-                                    <td>{{ '%.2f'|format(row.stmt_amount|float) if row.stmt_amount else '—' }}</td>
-                                    <td>{{ row.stmt_date or '—' }}</td>
+                                    <td>
+                                        {% if row.receipt_file %}
+                                        <img src="/receipt-image/{{ row.receipt_file }}" class="receipt-thumb" alt="{{ row.receipt_file }}" title="{{ row.receipt_file }}" onclick="showReceiptModal(this.src)">
+                                        {% else %}
+                                        <span style="color:var(--text-muted);"><i class="bi bi-image"></i></span>
+                                        {% endif %}
+                                    </td>
+                                    <td>{{ row.statement_description or '—' }}</td>
+                                    <td>{{ '%.2f'|format(row.statement_amount|float) if row.statement_amount else '—' }}</td>
+                                    <td>{{ row.statement_date or '—' }}</td>
                                     <td>{{ row.receipt_vendor or '—' }}</td>
                                     <td>{{ '%.2f'|format(row.receipt_amount|float) if row.receipt_amount else '—' }}</td>
                                     <td>{{ row.receipt_date or '—' }}</td>
+                                    <td>{{ row.credit_card_bank or '—' }}</td>
                                     <td>
                                         <select class="form-select form-select-sm cc-select" data-idx="{{ row._idx }}" data-entity="{{ row.entity or entity }}" style="min-width:180px; font-size:0.8rem;">
                                             <option value="">— Select —</option>
@@ -2313,12 +2436,122 @@ HTML_TEMPLATE = """
                 </div>
             </div>
             {% endif %}
+
+            <!-- Statement OCR Debug: Reconstructed Rows -->
+            <div class="data-card" style="margin-top:1rem;">
+                <div class="card-header" style="display:flex;align-items:center;justify-content:space-between;">
+                    <h5><i class="bi bi-list-columns-reverse"></i> Statement OCR — Reconstructed Rows <span style="font-size:.8rem;font-weight:400;color:var(--text-muted);">(pipe-separated, fed to parser)</span></h5>
+                    <span style="font-size:.8rem;color:var(--text-muted);">{{ debug_stmt_raw_rows|length }} row(s)</span>
+                </div>
+                <div class="card-body" style="padding:0;">
+                    {% if debug_stmt_raw_rows %}
+                    <div style="max-height:420px;overflow-y:auto;">
+                        <table class="data-table" style="font-size:.78rem;font-family:'JetBrains Mono','Courier New',monospace;">
+                            <thead>
+                                <tr>
+                                    <th style="width:2.5rem;">#</th>
+                                    <th>Row (columns separated by  |)</th>
+                                </tr>
+                            </thead>
+                            <tbody>
+                                {% for row in debug_stmt_raw_rows %}
+                                <tr>
+                                    <td style="color:var(--text-muted);text-align:right;">{{ loop.index }}</td>
+                                    <td style="white-space:pre-wrap;word-break:break-all;">{{ row }}</td>
+                                </tr>
+                                {% endfor %}
+                            </tbody>
+                        </table>
+                    </div>
+                    {% else %}
+                    <div class="empty-state" style="padding:1.5rem;">
+                        <p>Process a statement to see reconstructed rows.</p>
+                    </div>
+                    {% endif %}
+                </div>
+            </div>
+
+            <!-- Statement OCR Debug: Raw Words per Page -->
+            <div class="data-card" style="margin-top:1rem;">
+                <div class="card-header">
+                    <h5><i class="bi bi-braces"></i> Statement OCR — Raw Words per Page <span style="font-size:.8rem;font-weight:400;color:var(--text-muted);">(DocTR output, before row assembly)</span></h5>
+                </div>
+                <div class="card-body">
+                    {% if debug_stmt_ocr_words %}
+                    <div style="margin-bottom:.6rem;font-size:.78rem;color:var(--text-muted);">
+                        <span style="background:#f59e0b;color:#000;border-radius:3px;padding:1px 5px;margin-right:.4rem;">₹strip</span> ₹ glyph was stripped from this token
+                        &nbsp;<span style="background:#10b981;color:#fff;border-radius:3px;padding:1px 5px;margin-right:.4rem;">credit</span> credit marker detected
+                        &nbsp;<span style="background:#ef4444;color:#fff;border-radius:3px;padding:1px 5px;">low-conf</span> confidence &lt; 0.6
+                    </div>
+                    {% for page_info in debug_stmt_ocr_words %}
+                    <details style="margin-bottom:.6rem;border:1px solid var(--border);border-radius:8px;overflow:hidden;">
+                        <summary style="padding:.6rem 1rem;cursor:pointer;font-weight:600;background:var(--surface-alt);display:flex;justify-content:space-between;align-items:center;list-style:none;">
+                            <span><i class="bi bi-file-earmark-text"></i>&nbsp; Page {{ page_info.page }} &mdash; {{ page_info.words|length }} words</span>
+                            <span style="font-size:.75rem;font-weight:400;color:var(--text-muted);">{{ page_info.status }}</span>
+                        </summary>
+                        <div style="overflow-x:auto;max-height:380px;overflow-y:auto;">
+                            <table class="data-table" style="font-size:.74rem;font-family:'JetBrains Mono','Courier New',monospace;">
+                                <thead>
+                                    <tr>
+                                        <th style="width:2rem;">#</th>
+                                        <th>Text</th>
+                                        <th>Conf</th>
+                                        <th>x_min</th>
+                                        <th>y_min</th>
+                                        <th>x_max</th>
+                                        <th>y_max</th>
+                                        <th>Flags</th>
+                                    </tr>
+                                </thead>
+                                <tbody>
+                                    {% for w in page_info.words %}
+                                    <tr style="{% if w.get('rupee_prefix_stripped') %}background:rgba(245,158,11,.12);{% elif w.get('has_plus_prefix') %}background:rgba(16,185,129,.08);{% elif w.get('low_confidence') %}background:rgba(239,68,68,.06);{% endif %}">
+                                        <td style="color:var(--text-muted);text-align:right;">{{ loop.index }}</td>
+                                        <td><strong>{{ w.text }}</strong></td>
+                                        <td style="{% if w.confidence < 0.4 %}color:#f87171;{% elif w.confidence < 0.7 %}color:#fb923c;{% else %}color:#4ade80;{% endif %}">{{ '%.2f'|format(w.confidence) }}</td>
+                                        <td>{{ '%.3f'|format(w.x_min) }}</td>
+                                        <td>{{ '%.3f'|format(w.y_min) }}</td>
+                                        <td>{{ '%.3f'|format(w.x_max) }}</td>
+                                        <td>{{ '%.3f'|format(w.y_max) }}</td>
+                                        <td style="font-size:.7rem;white-space:nowrap;">
+                                            {% if w.get('rupee_prefix_stripped') %}<span style="background:#f59e0b;color:#000;border-radius:3px;padding:1px 4px;">₹strip</span> {% endif %}
+                                            {% if w.get('has_plus_prefix') %}<span style="background:#10b981;color:#fff;border-radius:3px;padding:1px 4px;">credit</span> {% endif %}
+                                            {% if w.get('low_confidence') %}<span style="background:#ef4444;color:#fff;border-radius:3px;padding:1px 4px;">low-conf</span> {% endif %}
+                                        </td>
+                                    </tr>
+                                    {% endfor %}
+                                </tbody>
+                            </table>
+                        </div>
+                    </details>
+                    {% endfor %}
+                    {% else %}
+                    <div class="empty-state" style="padding:1.5rem;">
+                        <p>Process a statement to see raw OCR words. (Only available when processing fresh — not from cache.)</p>
+                    </div>
+                    {% endif %}
+                </div>
+            </div>
+
         </div>
+
 
     </main>
 </div>
 
+<!-- Receipt Image Modal Overlay -->
+<div class="receipt-modal-overlay" id="receiptModal" onclick="this.classList.remove('active')">
+    <img id="receiptModalImg" src="" alt="Receipt Preview">
+</div>
+
 <script>
+    // Receipt image modal
+    function showReceiptModal(src) {
+        const modal = document.getElementById('receiptModal');
+        document.getElementById('receiptModalImg').src = src;
+        modal.classList.add('active');
+    }
+
     // Tab switching
     document.querySelectorAll('.tab-btn').forEach(btn => {
         btn.addEventListener('click', () => {
@@ -2449,6 +2682,10 @@ def index():
     df_statements = _app_state.get("df_statements")
     df_receipts = _app_state.get("df_receipts")
 
+    # Helper: convert human-readable column names to snake_case for template
+    def _to_snake(d):
+        return {k.lower().replace(" ", "_"): v for k, v in d.items()}
+
     # Compute stats
     n_receipts = len(df_receipts) if df_receipts is not None else 0
     n_transactions = len(df_statements) if df_statements is not None else 0
@@ -2458,25 +2695,15 @@ def index():
     unmatched_rows = []
 
     if df_matches is not None and not df_matches.empty:
-        approved_df = df_matches[df_matches["status"] == "auto_approved"]
-        review_df = df_matches[df_matches["status"] == "review"]
-        unmatched_df = df_matches[df_matches["status"] == "unmatched"]
+        approved_df = df_matches[df_matches["Status"] == "auto_approved"]
+        review_df = df_matches[df_matches["Status"] == "review"]
+        unmatched_df = df_matches[df_matches["Status"] == "unmatched"]
         n_approved = len(approved_df)
         n_review = len(review_df)
         n_unmatched = len(unmatched_df)
-        approved_rows = approved_df.to_dict("records")
-        review_rows = []
-        for idx, row in review_df.iterrows():
-            d = row.to_dict()
-            d["_idx"] = idx
-            review_rows.append(type("Row", (), d))
-        review_rows_raw = review_rows
-        review_rows = [type("Row", (), d) for d in [
-            {**row.to_dict(), "_idx": idx} for idx, row in review_df.iterrows()
-        ]]
-        unmatched_rows = unmatched_df.to_dict("records")
-        approved_rows = [type("Row", (), {**r, "_idx": i}) for i, r in zip(approved_df.index, approved_df.to_dict("records"))]
-        unmatched_rows = [type("Row", (), r) for r in unmatched_df.to_dict("records")]
+        approved_rows = [type("Row", (), {**_to_snake(r), "_idx": i}) for i, r in zip(approved_df.index, approved_df.to_dict("records"))]
+        review_rows = [type("Row", (), {**_to_snake(r), "_idx": idx}) for idx, r in review_df.to_dict("index").items()]
+        unmatched_rows = [type("Row", (), _to_snake(r)) for r in unmatched_df.to_dict("records")]
 
     # Credits
     credit_rows = []
@@ -2490,18 +2717,20 @@ def index():
     compare_data = []
     if df_matches is not None and not df_matches.empty:
         for _, row in df_matches.iterrows():
-            img_path = UPLOAD_DIR_RECEIPTS / row["receipt_file"]
+            img_path = UPLOAD_DIR_RECEIPTS / row["Receipt File"]
             compare_data.append({
-                "receipt_file": row["receipt_file"],
-                "receipt_vendor": row.get("receipt_vendor", ""),
-                "receipt_amount": row.get("receipt_amount", ""),
-                "receipt_date": row.get("receipt_date", ""),
-                "stmt_description": row.get("stmt_description", ""),
-                "stmt_amount": row.get("stmt_amount", ""),
-                "stmt_date": row.get("stmt_date", ""),
-                "score": row.get("match_score", 0),
+                "receipt_file": row["Receipt File"],
+                "receipt_vendor": row.get("Receipt Vendor", ""),
+                "receipt_amount": row.get("Receipt Amount", ""),
+                "receipt_date": row.get("Receipt Date", ""),
+                "stmt_description": row.get("Statement Description", ""),
+                "stmt_amount": row.get("Statement Amount", ""),
+                "stmt_date": row.get("Statement Date", ""),
+                "score": row.get("Match Score", 0),
+                "credit_card_bank": row.get("Credit Card Bank", ""),
                 "img_exists": img_path.exists(),
             })
+
 
     # Statements data for debug tab
     statements_data = []
@@ -2513,6 +2742,10 @@ def index():
     for name, dbg in _app_state.get("debug_receipt_ocr", {}).items():
         debug_receipts[name] = type("Dbg", (), dbg)
 
+    # Statement OCR debug data
+    debug_stmt_ocr_words = _app_state.get("debug_stmt_ocr_words", [])
+    debug_stmt_raw_rows  = _app_state.get("debug_stmt_raw_rows", [])
+
     # Cost centre options for the selected entity
     sel_entity = _app_state.get("selected_entity", ENTITY_OPTIONS[0])
     cc_map = ENTITY_COST_MAP.get(sel_entity, {})
@@ -2523,6 +2756,8 @@ def index():
         entity=sel_entity,
         entities=ENTITY_OPTIONS,
         cost_centre_options=cost_centre_options,
+        credit_card_bank=_app_state.get("credit_card_bank", ""),
+        credit_card_bank_options=CREDIT_CARD_BANK_OPTIONS,
         n_receipts=n_receipts,
         n_transactions=n_transactions,
         n_approved=n_approved,
@@ -2536,6 +2771,8 @@ def index():
         compare_data=compare_data,
         statements_data=statements_data,
         debug_receipts=debug_receipts,
+        debug_stmt_ocr_words=debug_stmt_ocr_words,
+        debug_stmt_raw_rows=debug_stmt_raw_rows,
         processing=_app_state.get("processing", False),
         progress=_app_state.get("progress", {"step": "", "pct": 0, "detail": ""}),
         log_lines=_app_state.get("log_lines", []),
@@ -2549,6 +2786,8 @@ def process():
         return redirect(url_for("index"))
 
     entity = request.form.get("entity", "Si2Tech")
+    credit_card_bank = request.form.get("credit_card_bank", "")
+    _app_state["credit_card_bank"] = credit_card_bank
     receipt_paths = []
     statement_path = None
 
@@ -2601,14 +2840,14 @@ def progress():
 def approve(idx):
     df = _app_state.get("df_matches")
     if df is not None and idx in df.index:
-        df.at[idx, "status"] = "auto_approved"
+        df.at[idx, "Status"] = "auto_approved"
         # Auto-fill cost centre and GL code if provided
         cc = request.args.get("cost_centre", "")
         if cc:
-            df.at[idx, "cost_centre"] = cc
-            ent = df.at[idx, "entity"] or _app_state.get("selected_entity", ENTITY_OPTIONS[0])
+            df.at[idx, "Cost Centre"] = cc
+            ent = df.at[idx, "Entity"] or _app_state.get("selected_entity", ENTITY_OPTIONS[0])
             cc_map = ENTITY_COST_MAP.get(ent, {})
-            df.at[idx, "gl_code"] = cc_map.get(cc, "")
+            df.at[idx, "GL Code"] = cc_map.get(cc, "")
         _save_state()
     return redirect(url_for("index"))
 
@@ -2632,8 +2871,8 @@ def api_update_cc():
     gl = data.get("gl_code", "")
     df = _app_state.get("df_matches")
     if df is not None and idx is not None and idx in df.index:
-        df.at[idx, "cost_centre"] = cc
-        df.at[idx, "gl_code"] = gl
+        df.at[idx, "Cost Centre"] = cc
+        df.at[idx, "GL Code"] = gl
         _save_state()
     return jsonify({"ok": True})
 
@@ -2646,6 +2885,8 @@ def clear():
     _app_state["debug_receipt_ocr"] = {}
     _app_state["log_lines"] = []
     _app_state["progress"] = {"step": "", "pct": 0, "detail": ""}
+    _app_state["processing"] = False
+    _app_state["credit_card_bank"] = ""
     _SESSION_CACHE_FILE.unlink(missing_ok=True)
     for f in CACHE_DIR_STATEMENTS.glob("*.json"):
         f.unlink(missing_ok=True)
@@ -2680,11 +2921,11 @@ def export(category, fmt):
     df_statements = _app_state.get("df_statements")
 
     if category == "approved" and df_matches is not None:
-        df = df_matches[df_matches["status"] == "auto_approved"]
+        df = df_matches[df_matches["Status"] == "auto_approved"]
     elif category == "review" and df_matches is not None:
-        df = df_matches[df_matches["status"] == "review"]
+        df = df_matches[df_matches["Status"] == "review"]
     elif category == "unmatched" and df_matches is not None:
-        df = df_matches[df_matches["status"] == "unmatched"]
+        df = df_matches[df_matches["Status"] == "unmatched"]
     elif category == "credits" and df_statements is not None:
         df = df_statements[df_statements["type"] == "credit"]
     elif category == "all" and df_matches is not None:

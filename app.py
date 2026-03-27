@@ -1337,6 +1337,20 @@ def _strip_bogus_rupee_2(amt_str: str, desc: str) -> str:
 
     desc_lower = desc.lower()
 
+    # ── Universal rule: no-comma 4-digit integer is ALWAYS a ₹ artifact ──────
+    # Indian bank statements ALWAYS format amounts ≥ 1,000 with a comma.
+    # Any token like "7367.00" (4 integer digits, no comma) is structurally
+    # impossible as a real printed amount — the leading digit is the ₹ glyph.
+    # Covers ALL digit variants: 7367→367, 2367→367, 8367→367, etc.
+    _nc4 = re.match(r'^(\d)(\d{3}\.\d{2})$', amt_str)
+    if _nc4:
+        return prefix + _nc4.group(2)
+
+    # 5-digit no-comma: e.g. "71234.00" → strip leading digit → "1234.00"
+    _nc5 = re.match(r'^(\d)(\d{4}\.\d{2})$', amt_str)
+    if _nc5:
+        return prefix + _nc5.group(2)
+
     # 1. Comma violation: 2XX,XXX.XX → XX,XXX.XX
     # Indian numbering never has a 3-digit group before the first comma
     # (rightmost group is 3 digits, all others are 2).  A leading '2'
@@ -1346,10 +1360,7 @@ def _strip_bogus_rupee_2(amt_str: str, desc: str) -> str:
 
     # 2. IGST / GST tax transactions: ₹X.XX misread as 2X.XX
     # Pattern: amount is 2<single_digit>.<cents>  →  real amount is <single_digit>.<cents>
-    # Signal: description contains IGST, GST, or a RATE: marker.
-    # These are always small computed tax amounts — a genuine two-digit
-    # amount like 26.63 would never appear on a tax line computed at
-    # RATE 18% from a base of only a few rupees.
+    # Signal: description contains IGST, GST, or a RATE: marker (small computed tax amounts).
     _GST_KWDS = ('igst', 'cgst', 'sgst', 'gst', 'rate:', 'rate :', 'tax')
     _has_gst_desc = any(kw in desc_lower for kw in _GST_KWDS)
     # 2a. 2X.XX → X.XX  (single integer digit, e.g. 26.63 → 6.63, 28.07 → 8.07)
@@ -1358,10 +1369,9 @@ def _strip_bogus_rupee_2(amt_str: str, desc: str) -> str:
     # 2b. 2XX.XX → XX.XX  (two integer digits, e.g. 215.00 → 15.00)
     if _has_gst_desc and re.match(r'^2\d{2}\.\d{2}$', amt_str):
         strippable = amt_str[1:]
-        # Extra guard: stripped value must be plausible (>0 and not starting with 0)
         if not strippable.startswith('0'):
             return prefix + strippable
-    # 2c. 2,XXX.XX → XXX.XX  (three integer digits with comma, e.g. 2,500.00 → 500.00 on a GST line)
+    # 2c. 2,XXX.XX → XXX.XX  (with comma, e.g. 2,500.00 → 500.00 on a GST line)
     if _has_gst_desc and re.match(r'^2,\d{3}\.\d{2}$', amt_str):
         return prefix + amt_str[2:]  # strip '2,'
 
@@ -1374,6 +1384,10 @@ def _strip_bogus_rupee_2(amt_str: str, desc: str) -> str:
         return prefix + '5,059.00'
 
     return prefix + amt_str
+
+# Backward-compat alias
+_strip_bogus_rupee_prefix = _strip_bogus_rupee_2
+
 
 def parse_rows_columnar(rows: list[str]) -> list[dict]:
     """PRIMARY parser: directly use the pipe-column structure from build_rows().

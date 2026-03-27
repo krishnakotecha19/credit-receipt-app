@@ -43,6 +43,30 @@ _TRAIL_R_CREDIT = re.compile(r'^([+\-]?\d[\d,]*\.\d{2})[Rr]$')
 _DATE_TRAIL_CLEANUP = re.compile(r'^(\d{2}[/\-]\d{2}[/\-]\d{2,4})[\d\]Il|]{1,3}$')
 
 # ---------------------------------------------------------------------------
+# ₹ prefix artifact patterns
+# ---------------------------------------------------------------------------
+# DocTR misreads the ₹ glyph in several ways:
+#   (a) As a letter: R, B, F, E, ?, or the literal ₹ character
+#   (b) As a digit: most commonly 2 or 7, but also 8, 9, 6, etc.
+#
+# For (a) the prefix is unambiguously non-numeric — safe to strip outright.
+# For (b) the prefix digit is ambiguous against real digits.  We use the
+#   Indian number format rule to detect it:
+#
+#   ** Indian bank statements ALWAYS format amounts ≥ 1000 with a comma:
+#      1,234.56   7,367.00   not   1234.56   7367.00
+#
+#   So a token whose integer part has 4+ digits with NO comma is structurally
+#   invalid — the first digit is the ₹ glyph.
+#   Stripping it leaves a valid 1-3 digit amount (or 4+ commaed amount).
+#
+# Pattern: strip any leading char that, once removed, leaves a valid amount
+# AND (original had no comma in 4+ integer digits).
+_NOCOMMA_4DIGIT_RE = re.compile(r'^[+\-]?(\d)(\d{3}\.\d{2})$')  # e.g. 7367.00 → 367.00
+_NOCOMMA_5DIGIT_RE = re.compile(r'^[+\-]?(\d)(\d{4}\.\d{2})$')  # e.g. 71234.00 → 1234.00 (then needs comma check)
+_LETTER_PREFIX_RE  = re.compile(r'^[RBFEb?₹]+(\d[\d,]*\.\d{2})$')
+
+# ---------------------------------------------------------------------------
 # DocTR engine (one-time init per process)
 # ---------------------------------------------------------------------------
 _doctr_engine = None
@@ -243,13 +267,50 @@ def process_statement_pdf(pdf_path: str, poppler_path: str = None) -> list[dict]
                         raw_text = _tc.group(1)   # strip trailing row-index digit(s)
 
                     # --- Strip OCR artifacts for ₹ symbol prepended to amounts ---
-                    # DocTR frequently reads the '₹' symbol as 'R', '?', or literally '₹'.
-                    # This happens right before the numeric amount. If we leave it, the LLM
-                    # or downstream regex might misparse it.
-                    # Note: We cannot safely strip '2' because it's ambiguous with real amounts.
-                    _PREFIX_CLEANUP = re.compile(r'^[R\?₹]+')
-                    if re.match(r'^[R\?₹]+[+\-]?\d[\d,]*\.\d{2}$', raw_text):
-                        raw_text = _PREFIX_CLEANUP.sub('', raw_text)
+                    # DocTR reads the ₹ glyph in two ways, both produce bogus leading chars:
+                    #
+                    # (a) Letter variant: R, B, F, E, ?, ₹          → strip outright
+                    # (b) Digit variant:  2, 7, 8, 9, 6, etc.        → strip via structural rule
+                    #
+                    # Structural rule for digit variants:
+                    #   Indian bank statements ALWAYS comma-format amounts ≥ 1000:
+                    #     real 7367 rupees → printed as "7,367.00"
+                    #   So a 4-digit no-comma integer in an amount token is ALWAYS bogus.
+                    #   Stripping the leading digit recovers the true amount.
+                    #   This handles 7367.00→367.00, 2367.00→367.00, etc.
+
+                    rupee_prefix_stripped = False
+
+                    # (a) Explicit non-numeric ₹ prefix (R, B, F, E, ?, ₹)
+                    _lm = _LETTER_PREFIX_RE.match(raw_text)
+                    if _lm:
+                        raw_text = _lm.group(1)
+                        rupee_prefix_stripped = True
+
+                    # (b) Digit prefix via no-comma 4-digit rule
+                    #   e.g. "7367.00" → integer part "7367" has 4 digits, no comma → strip "7" → "367.00"
+                    if not rupee_prefix_stripped:
+                        _sgn = ""
+                        _chk = raw_text
+                        if _chk[:1] in ('+', '-'):
+                            _sgn = _chk[0]
+                            _chk = _chk[1:]
+                        _nm = _NOCOMMA_4DIGIT_RE.match(_sgn + _chk)
+                        if _nm:
+                            # 4-digit no-comma integer — first digit is ₹ artifact
+                            raw_text = _sgn + _nm.group(2)
+                            rupee_prefix_stripped = True
+                        elif not rupee_prefix_stripped:
+                            # 5-digit no-comma: XNNNN.DD → if removing first digit gives
+                            # a comma-formatted amount that makes sense (e.g. 71234.00 → 1,234 requires comma)
+                            # Only strip if remainder starts by forming a comma-insertable valid amount
+                            _nm5 = _NOCOMMA_5DIGIT_RE.match(_sgn + _chk)
+                            if _nm5:
+                                remainder = _nm5.group(2)  # 4 digits + .DD, e.g. "1234.00"
+                                # Real 4-digit amounts are always printed with comma: 1,234
+                                # so a bare 4-digit chunk is also bogus
+                                raw_text = _sgn + remainder
+                                rupee_prefix_stripped = True
 
                     # --- Credit detection ---
                     # Two reliable signals:
@@ -288,6 +349,7 @@ def process_statement_pdf(pdf_path: str, poppler_path: str = None) -> list[dict]
                         "y_max": float(y_max),
                         "low_confidence": bool(conf < 0.6),
                         "has_plus_prefix": bool(plus_prefix),
+                        "rupee_prefix_stripped": bool(rupee_prefix_stripped),
                     })
         pages_out.append({
             "page_number": page_idx + 1,
