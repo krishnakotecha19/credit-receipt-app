@@ -2218,9 +2218,7 @@ HTML_TEMPLATE = """
             <button type="button" class="tab-btn" data-tab="debug">
                 <i class="bi bi-bug"></i> Debug
             </button>
-        </div>
-        <div style="margin: 0.5rem 0 1rem 0;">
-            <button type="button" class="tab-btn" data-tab="sync" id="btnSyncSP" style="background:linear-gradient(135deg,#06B6D4,#3B82F6); color:#fff; border-radius:var(--radius-sm); font-weight:600; padding:8px 20px; border:none; cursor:pointer; font-size:0.85rem;">
+            <button type="button" class="tab-btn" data-tab="sync" id="btnSyncSP" style="margin-left:auto; background:linear-gradient(135deg,#06B6D4,#3B82F6); color:#fff; border-radius:var(--radius-sm); font-weight:600; padding:8px 20px; border:none; cursor:pointer; font-size:0.85rem;">
                 <i class="bi bi-cloud-arrow-down"></i> Sync SharePoint
             </button>
         </div>
@@ -2838,7 +2836,10 @@ HTML_TEMPLATE = """
             
             const msgObj = document.getElementById('syncPlaceholder');
             const resObj = document.getElementById('syncResults');
-            if (msgObj) msgObj.style.display = 'none';
+            if (msgObj) {
+                msgObj.style.display = 'block';
+                msgObj.innerHTML = '<div style="text-align:center; padding: 2rem;"><div class="spinner-border text-primary" role="status" style="width: 3rem; height: 3rem;"></div><p style="margin-top:1rem; color:var(--text-muted); font-weight:500;">Connecting to SharePoint...</p></div>';
+            }
             if (resObj) resObj.style.display = 'none';
 
             fetch('/api/sync/' + encodeURIComponent(entity), {
