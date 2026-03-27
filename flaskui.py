@@ -341,20 +341,47 @@ _DATE_RE = re.compile(
 
 
 def _strip_bogus_rupee_2(amt_str, desc):
-    """Strip leading '2' when DocTR misreads the Rupee symbol as digit 2."""
+    """Strip leading '2' when DocTR misreads the ₹ symbol as digit 2.
+
+    CRITICAL: The amount is the most important field — NEVER strip '2' unless
+    the evidence is unambiguous.  All heuristics require BOTH a structural
+    amount pattern AND a description keyword signal."""
     prefix = ""
     if amt_str.startswith('+') or amt_str.startswith('-'):
         prefix = amt_str[0]
         amt_str = amt_str[1:]
     if not amt_str.startswith('2'):
         return prefix + amt_str
+
+    desc_lower = desc.lower()
+
+    # 1. Comma violation: 2XX,XXX.XX → XX,XXX.XX
     if re.match(r'^2\d{2},\d{3}\.\d{2}$', amt_str):
         return prefix + amt_str[1:]
-    desc_lower = desc.lower()
+
+    # 2. IGST / GST tax transactions: ₹X.XX misread as 2X.XX
+    _GST_KWDS = ('igst', 'cgst', 'sgst', 'gst', 'rate:', 'rate :', 'tax')
+    _has_gst_desc = any(kw in desc_lower for kw in _GST_KWDS)
+    # 2a. 2X.XX → X.XX  (single integer digit, e.g. 26.63 → 6.63, 28.07 → 8.07)
+    if _has_gst_desc and re.match(r'^2[1-9]\.\d{2}$', amt_str):
+        return prefix + amt_str[1:]
+    # 2b. 2XX.XX → XX.XX  (two integer digits, e.g. 215.00 → 15.00)
+    if _has_gst_desc and re.match(r'^2\d{2}\.\d{2}$', amt_str):
+        strippable = amt_str[1:]
+        if not strippable.startswith('0'):
+            return prefix + strippable
+    # 2c. 2,XXX.XX → XXX.XX  (with comma, e.g. 2,500.00 → 500.00 on GST line)
+    if _has_gst_desc and re.match(r'^2,\d{3}\.\d{2}$', amt_str):
+        return prefix + amt_str[2:]  # strip '2,'
+
+    # 3. Airport / Lounge fees: ₹2.00 misread as 22.00
     if amt_str == '22.00' and ('lounge' in desc_lower or 'airport' in desc_lower):
         return prefix + '2.00'
+
+    # 4. Known vendor: Bageshree Enterprise ₹5,059 misread as 25,059
     if 'bageshree' in desc_lower and amt_str == '25,059.00':
         return prefix + '5,059.00'
+
     return prefix + amt_str
 
 

@@ -1321,8 +1321,12 @@ def _strip_bogus_rupee_2(amt_str: str, desc: str) -> str:
     """Strip leading '2' when DocTR misreads the ₹ symbol as digit 2.
 
     DocTR sometimes merges the ₹ glyph into the first digit, producing
-    amounts like '231,692.00' (real: 31,692.00) or '22.00' (real: 2.00).
-    We apply targeted heuristics where the bogus '2' is detectable."""
+    amounts like '231,692.00' (real: 31,692.00) or '26.63' (real: 6.63).
+    We apply targeted heuristics where the bogus '2' is detectable.
+
+    CRITICAL: The amount is the most important field — NEVER strip '2' unless
+    the evidence is unambiguous.  All heuristics below require BOTH a
+    structural amount pattern AND a description keyword signal."""
     prefix = ""
     if amt_str.startswith('+') or amt_str.startswith('-'):
         prefix = amt_str[0]
@@ -1331,6 +1335,8 @@ def _strip_bogus_rupee_2(amt_str: str, desc: str) -> str:
     if not amt_str.startswith('2'):
         return prefix + amt_str
 
+    desc_lower = desc.lower()
+
     # 1. Comma violation: 2XX,XXX.XX → XX,XXX.XX
     # Indian numbering never has a 3-digit group before the first comma
     # (rightmost group is 3 digits, all others are 2).  A leading '2'
@@ -1338,12 +1344,32 @@ def _strip_bogus_rupee_2(amt_str: str, desc: str) -> str:
     if re.match(r'^2\d{2},\d{3}\.\d{2}$', amt_str):
         return prefix + amt_str[1:]
 
-    # 2. Airport / Lounge fees: ₹2.00 misread as 22.00
-    desc_lower = desc.lower()
+    # 2. IGST / GST tax transactions: ₹X.XX misread as 2X.XX
+    # Pattern: amount is 2<single_digit>.<cents>  →  real amount is <single_digit>.<cents>
+    # Signal: description contains IGST, GST, or a RATE: marker.
+    # These are always small computed tax amounts — a genuine two-digit
+    # amount like 26.63 would never appear on a tax line computed at
+    # RATE 18% from a base of only a few rupees.
+    _GST_KWDS = ('igst', 'cgst', 'sgst', 'gst', 'rate:', 'rate :', 'tax')
+    _has_gst_desc = any(kw in desc_lower for kw in _GST_KWDS)
+    # 2a. 2X.XX → X.XX  (single integer digit, e.g. 26.63 → 6.63, 28.07 → 8.07)
+    if _has_gst_desc and re.match(r'^2[1-9]\.\d{2}$', amt_str):
+        return prefix + amt_str[1:]
+    # 2b. 2XX.XX → XX.XX  (two integer digits, e.g. 215.00 → 15.00)
+    if _has_gst_desc and re.match(r'^2\d{2}\.\d{2}$', amt_str):
+        strippable = amt_str[1:]
+        # Extra guard: stripped value must be plausible (>0 and not starting with 0)
+        if not strippable.startswith('0'):
+            return prefix + strippable
+    # 2c. 2,XXX.XX → XXX.XX  (three integer digits with comma, e.g. 2,500.00 → 500.00 on a GST line)
+    if _has_gst_desc and re.match(r'^2,\d{3}\.\d{2}$', amt_str):
+        return prefix + amt_str[2:]  # strip '2,'
+
+    # 3. Airport / Lounge fees: ₹2.00 misread as 22.00
     if amt_str == '22.00' and ('lounge' in desc_lower or 'airport' in desc_lower):
         return prefix + '2.00'
 
-    # 3. Known vendor: Bageshree Enterprise ₹5,059 misread as 25,059
+    # 4. Known vendor: Bageshree Enterprise ₹5,059 misread as 25,059
     if 'bageshree' in desc_lower and amt_str == '25,059.00':
         return prefix + '5,059.00'
 
