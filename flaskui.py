@@ -120,6 +120,12 @@ app = Flask(__name__)
 app.secret_key = os.environ.get("FLASK_SECRET_KEY", "dev-secret-key-change-in-prod")
 app.config["MAX_CONTENT_LENGTH"] = 100 * 1024 * 1024  # 100 MB
 
+
+@app.route("/favicon.ico")
+def favicon():
+    """Return empty favicon to suppress browser 404 errors."""
+    return Response(status=204)
+
 # ---------------------------------------------------------------------------
 # In-memory state (replaces Streamlit session_state)
 # ---------------------------------------------------------------------------
