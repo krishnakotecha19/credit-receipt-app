@@ -1692,40 +1692,176 @@ HTML_TEMPLATE = """
         .progress-container {
             background: var(--surface);
             border-radius: var(--radius);
-            padding: 1.25rem;
-            box-shadow: var(--shadow);
-            border: 1px solid var(--border);
+            padding: 1.5rem;
+            box-shadow: var(--shadow), 0 0 20px rgba(99,102,241,0.08);
+            border: 1px solid rgba(99,102,241,0.2);
             margin-bottom: 1.5rem;
+            position: relative;
+            overflow: hidden;
         }
+        .progress-container::before {
+            content: '';
+            position: absolute;
+            top: 0; left: 0; right: 0;
+            height: 3px;
+            background: linear-gradient(90deg, var(--primary), var(--accent), var(--primary));
+            background-size: 200% 100%;
+            animation: progressShine 2s linear infinite;
+        }
+        @keyframes progressShine {
+            0% { background-position: 200% 0; }
+            100% { background-position: -200% 0; }
+        }
+
+        /* Steps tracker */
+        .progress-steps {
+            display: flex;
+            justify-content: space-between;
+            margin-bottom: 1.25rem;
+            position: relative;
+        }
+        .progress-steps::before {
+            content: '';
+            position: absolute;
+            top: 14px;
+            left: 15%;
+            right: 15%;
+            height: 2px;
+            background: var(--border);
+            z-index: 0;
+        }
+        .progress-step {
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            gap: 6px;
+            z-index: 1;
+            flex: 1;
+        }
+        .progress-step .step-dot {
+            width: 28px;
+            height: 28px;
+            border-radius: 50%;
+            background: var(--surface-alt);
+            border: 2px solid var(--border);
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            font-size: 0.7rem;
+            font-weight: 700;
+            color: var(--text-muted);
+            transition: all 0.4s ease;
+        }
+        .progress-step.active .step-dot {
+            background: var(--primary);
+            border-color: var(--primary);
+            color: #fff;
+            box-shadow: 0 0 12px rgba(99,102,241,0.5);
+            animation: stepPulse 1.5s ease-in-out infinite;
+        }
+        .progress-step.done .step-dot {
+            background: var(--success);
+            border-color: var(--success);
+            color: #fff;
+        }
+        .progress-step .step-label {
+            font-size: 0.7rem;
+            font-weight: 500;
+            color: var(--text-muted);
+            transition: color 0.3s;
+        }
+        .progress-step.active .step-label { color: var(--primary); font-weight: 600; }
+        .progress-step.done .step-label { color: var(--success); }
+        @keyframes stepPulse {
+            0%, 100% { box-shadow: 0 0 6px rgba(99,102,241,0.3); }
+            50% { box-shadow: 0 0 18px rgba(99,102,241,0.6); }
+        }
+
+        /* Header row */
         .progress-container .progress-header {
             display: flex;
             justify-content: space-between;
-            margin-bottom: 0.75rem;
+            align-items: center;
+            margin-bottom: 0.5rem;
         }
         .progress-container .progress-header .step-name {
             font-weight: 600;
             font-size: 0.9rem;
+            display: flex;
+            align-items: center;
+            gap: 8px;
         }
         .progress-container .progress-header .pct {
-            font-weight: 600;
+            font-weight: 700;
+            font-size: 1.1rem;
             color: var(--primary);
+            font-variant-numeric: tabular-nums;
         }
+
+        /* Track */
         .progress-bar-track {
-            height: 8px;
+            height: 10px;
             background: var(--surface-alt);
-            border-radius: 4px;
+            border-radius: 5px;
             overflow: hidden;
+            position: relative;
         }
         .progress-bar-fill {
             height: 100%;
-            background: linear-gradient(90deg, var(--primary), var(--accent));
-            border-radius: 4px;
-            transition: width 0.3s ease;
+            background: linear-gradient(90deg, var(--primary), var(--accent), var(--primary));
+            background-size: 200% 100%;
+            border-radius: 5px;
+            transition: width 0.5s cubic-bezier(0.4,0,0.2,1);
+            position: relative;
+        }
+        .progress-bar-fill.animate {
+            animation: barShimmer 1.5s linear infinite;
+        }
+        @keyframes barShimmer {
+            0% { background-position: 200% 0; }
+            100% { background-position: -200% 0; }
+        }
+        /* Indeterminate mode — bouncing stripe when stuck at 0% */
+        .progress-bar-track.indeterminate::after {
+            content: '';
+            position: absolute;
+            top: 0; bottom: 0;
+            left: 0;
+            width: 40%;
+            border-radius: 5px;
+            background: linear-gradient(90deg, transparent, rgba(99,102,241,0.35), var(--primary), rgba(99,102,241,0.35), transparent);
+            animation: indeterminate 1.4s ease-in-out infinite;
+        }
+        @keyframes indeterminate {
+            0%   { left: -40%; }
+            100% { left: 100%; }
+        }
+
+        /* Detail + elapsed */
+        .progress-detail-row {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            margin-top: 0.6rem;
         }
         .progress-detail {
             font-size: 0.8rem;
             color: var(--text-muted);
-            margin-top: 0.5rem;
+        }
+        .progress-detail .detail-spinner {
+            display: inline-block;
+            width: 10px; height: 10px;
+            border: 2px solid var(--border);
+            border-top-color: var(--primary);
+            border-radius: 50%;
+            animation: spin 0.8s linear infinite;
+            margin-right: 6px;
+            vertical-align: middle;
+        }
+        .progress-elapsed {
+            font-size: 0.75rem;
+            color: var(--text-muted);
+            font-variant-numeric: tabular-nums;
         }
 
 
@@ -1949,18 +2085,45 @@ HTML_TEMPLATE = """
             </div>
         </form>
 
-        <!-- Progress Log -->
+        <!-- Progress Section -->
         <div id="progressSection" style="display: {{ 'block' if processing else 'none' }}; margin-top: 1.25rem;">
-            <h6><i class="bi bi-activity"></i> Processing</h6>
             <div class="progress-container">
+                <!-- Step tracker dots -->
+                <div class="progress-steps" id="progressSteps">
+                    <div class="progress-step {{ 'active' if progress.step == 'Receipts' else ('done' if progress.step in ('Statements','Matching','Done') else '') }}" data-step="Receipts">
+                        <span class="step-dot">1</span>
+                        <span class="step-label">Receipts</span>
+                    </div>
+                    <div class="progress-step {{ 'active' if progress.step == 'Statements' else ('done' if progress.step in ('Matching','Done') else '') }}" data-step="Statements">
+                        <span class="step-dot">2</span>
+                        <span class="step-label">Statements</span>
+                    </div>
+                    <div class="progress-step {{ 'active' if progress.step == 'Matching' else ('done' if progress.step == 'Done' else '') }}" data-step="Matching">
+                        <span class="step-dot">3</span>
+                        <span class="step-label">Matching</span>
+                    </div>
+                    <div class="progress-step {{ 'done' if progress.step == 'Done' else '' }}" data-step="Done">
+                        <span class="step-dot"><i class="bi bi-check-lg"></i></span>
+                        <span class="step-label">Done</span>
+                    </div>
+                </div>
+
+                <!-- Current step header -->
                 <div class="progress-header">
-                    <span class="step-name" id="stepName">{{ progress.step }}</span>
+                    <span class="step-name" id="stepName"><span class="detail-spinner"></span> {{ progress.step or 'Starting...' }}</span>
                     <span class="pct" id="stepPct">{{ progress.pct }}%</span>
                 </div>
-                <div class="progress-bar-track">
-                    <div class="progress-bar-fill" id="progressBar" style="width: {{ progress.pct }}%"></div>
+
+                <!-- Bar -->
+                <div class="progress-bar-track {{ 'indeterminate' if progress.pct == 0 else '' }}" id="progressTrack">
+                    <div class="progress-bar-fill animate" id="progressBar" style="width: {{ progress.pct }}%"></div>
                 </div>
-                <div class="progress-detail" id="progressDetail">{{ progress.detail }}</div>
+
+                <!-- Detail + elapsed timer -->
+                <div class="progress-detail-row">
+                    <span class="progress-detail" id="progressDetail">{{ progress.detail or 'Initializing pipeline...' }}</span>
+                    <span class="progress-elapsed" id="progressElapsed">0:00</span>
+                </div>
             </div>
         </div>
     </aside>
@@ -2601,6 +2764,7 @@ HTML_TEMPLATE = """
         btn.disabled = true;
         btn.innerHTML = '<span class="spinner"></span> Processing...';
         document.getElementById('progressSection').style.display = 'block';
+        window._progressStartTime = Date.now();
     });
 
     // GL code auto-fill when cost centre is selected
@@ -2638,19 +2802,68 @@ HTML_TEMPLATE = """
 
     // Poll progress if processing
     {% if processing %}
+    window._progressStartTime = window._progressStartTime || Date.now();
+    const _STEP_ORDER = ['Receipts', 'Receipts (Online)', 'Statements', 'Matching', 'Done'];
+    const _STEP_MAP = {'Receipts': 'Receipts', 'Receipts (Online)': 'Receipts', 'Statements': 'Statements', 'Matching': 'Matching', 'Done': 'Done'};
+
+    function _updateStepDots(currentStep) {
+        const mapped = _STEP_MAP[currentStep] || currentStep;
+        const order = ['Receipts', 'Statements', 'Matching', 'Done'];
+        const ci = order.indexOf(mapped);
+        document.querySelectorAll('#progressSteps .progress-step').forEach(el => {
+            const si = order.indexOf(el.dataset.step);
+            el.classList.remove('active', 'done');
+            if (si < ci) el.classList.add('done');
+            else if (si === ci) el.classList.add(mapped === 'Done' ? 'done' : 'active');
+        });
+    }
+
+    function _updateElapsed() {
+        const s = Math.floor((Date.now() - window._progressStartTime) / 1000);
+        const m = Math.floor(s / 60);
+        const sec = String(s % 60).padStart(2, '0');
+        const el = document.getElementById('progressElapsed');
+        if (el) el.textContent = m + ':' + sec;
+    }
+    const _elapsedTimer = setInterval(_updateElapsed, 1000);
+
     (function pollProgress() {
         fetch('/progress')
             .then(r => r.json())
             .then(data => {
-                document.getElementById('stepName').textContent = data.step;
+                const stepEl = document.getElementById('stepName');
+                stepEl.innerHTML = '<span class="detail-spinner"></span> ' + (data.step || 'Starting...');
                 document.getElementById('stepPct').textContent = data.pct + '%';
-                document.getElementById('progressBar').style.width = data.pct + '%';
-                document.getElementById('progressDetail').textContent = data.detail;
+
+                const bar = document.getElementById('progressBar');
+                const track = document.getElementById('progressTrack');
+                bar.style.width = data.pct + '%';
+
+                // Toggle indeterminate when at 0%
+                if (data.pct === 0) {
+                    track.classList.add('indeterminate');
+                    bar.style.width = '0%';
+                } else {
+                    track.classList.remove('indeterminate');
+                }
+
+                // Keep shimmer while processing, remove when done
+                if (!data.processing) bar.classList.remove('animate');
+
+                document.getElementById('progressDetail').textContent = data.detail || 'Working...';
+
+                // Update step dots
+                _updateStepDots(data.step);
 
                 if (data.processing) {
                     setTimeout(pollProgress, 1000);
                 } else {
-                    setTimeout(() => location.reload(), 500);
+                    clearInterval(_elapsedTimer);
+                    stepEl.innerHTML = '<i class="bi bi-check-circle-fill" style="color:var(--success)"></i> Complete!';
+                    document.getElementById('stepPct').textContent = '100%';
+                    bar.style.width = '100%';
+                    track.classList.remove('indeterminate');
+                    setTimeout(() => location.reload(), 800);
                 }
             })
             .catch(() => setTimeout(pollProgress, 2000));
