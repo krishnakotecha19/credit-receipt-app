@@ -3178,12 +3178,12 @@ HTML_TEMPLATE = """
                         var nameEl = document.createElement("strong");
                         nameEl.textContent = s.name + (sizeKB ? " (" + sizeKB + ")" : "");
                         nameEl.style.flex = "1";
-                        var ocrBtn = document.createElement("button");
-                        ocrBtn.textContent = "Run OCR";
-                        ocrBtn.style.cssText = "font-size:.75rem;padding:4px 12px;background:linear-gradient(135deg,#10b981,#059669);color:#fff;border:none;border-radius:4px;cursor:pointer;font-weight:600;";
-                        ocrBtn.addEventListener("click", function() { _runOCR(entity, s.id, "statement", ocrBtn, s.name); });
+                        var stageBtn = document.createElement("button");
+                        stageBtn.textContent = "Stage";
+                        stageBtn.style.cssText = "font-size:.75rem;padding:4px 12px;background:linear-gradient(135deg,#10b981,#059669);color:#fff;border:none;border-radius:4px;cursor:pointer;font-weight:600;";
+                        stageBtn.addEventListener("click", function() { _stageFromSP(entity, s.id, "statement", stageBtn, s.name); });
                         row.appendChild(nameEl);
-                        row.appendChild(ocrBtn);
+                        row.appendChild(stageBtn);
                         stmtBox.appendChild(row);
                     })(meta.statements[i]);
                 }
@@ -3199,10 +3199,10 @@ HTML_TEMPLATE = """
                         var bname = document.createElement("strong");
                         bname.textContent = b.name;
                         bname.style.flex = "1";
-                        var ocrBtn = document.createElement("button");
-                        ocrBtn.textContent = "Run OCR";
-                        ocrBtn.style.cssText = "font-size:.75rem;padding:4px 12px;background:linear-gradient(135deg,#10b981,#059669);color:#fff;border:none;border-radius:4px;cursor:pointer;font-weight:600;";
-                        ocrBtn.addEventListener("click", function() { _runOCR(entity, b.id, "receipt_batch", ocrBtn, b.name); });
+                        var stageBtn = document.createElement("button");
+                        stageBtn.textContent = "Stage";
+                        stageBtn.style.cssText = "font-size:.75rem;padding:4px 12px;background:linear-gradient(135deg,#10b981,#059669);color:#fff;border:none;border-radius:4px;cursor:pointer;font-weight:600;";
+                        stageBtn.addEventListener("click", function() { _stageFromSP(entity, b.id, "receipt_batch", stageBtn, b.name); });
                         brow.appendChild(bname);
                         brow.appendChild(ocrBtn);
                         batchBox.appendChild(brow);
@@ -3219,7 +3219,7 @@ HTML_TEMPLATE = """
         });
     }
 
-    function _runOCR(entity, id, type, btnEl, fileName) {
+    function _stageFromSP(entity, id, type, btnEl, fileName) {
         var origText = btnEl.textContent;
         btnEl.disabled = true;
         btnEl.textContent = "Downloading...";
@@ -3232,7 +3232,7 @@ HTML_TEMPLATE = """
             payload.item_id = id;
         }
 
-        fetch("/api/ocr/sharepoint/" + encodeURIComponent(entity), {
+        fetch("/api/stage/sharepoint/" + encodeURIComponent(entity), {
             method: "POST",
             headers: {"Content-Type": "application/json"},
             body: JSON.stringify(payload)
@@ -3240,35 +3240,28 @@ HTML_TEMPLATE = """
         .then(function(r) { return r.json(); })
         .then(function(data) {
             if (data.ok) {
-                if (data.status === "cached") {
-                    alert("Loaded from cache: " + (data.transactions || 0) + " transactions");
-                    location.reload();
-                    return;
-                }
-                // Update sidebar drop zones to show SharePoint file
+                btnEl.textContent = "Staged!";
+                btnEl.style.background = "#059669";
+
+                // Update sidebar drop zones
                 if (type === "statement") {
                     var stmtBadge = document.getElementById("stmtBadge");
                     var stmtZone = document.getElementById("stmtZone");
-                    if (stmtBadge) stmtBadge.innerHTML = '<span class="file-badge" style="color:var(--success);"><i class="bi bi-cloud-check-fill"></i> ' + (fileName || "SharePoint PDF") + '</span>';
+                    if (stmtBadge) stmtBadge.innerHTML = '<span class="file-badge" style="color:var(--success);"><i class="bi bi-cloud-check-fill"></i> ' + (data.filename || "SharePoint PDF") + '</span>';
                     if (stmtZone) stmtZone.style.borderColor = "var(--success)";
                 } else if (type === "receipt_batch") {
                     var rcptBadge = document.getElementById("receiptBadge");
                     var rcptZone = document.getElementById("receiptZone");
-                    if (rcptBadge) rcptBadge.innerHTML = '<span class="file-badge" style="color:var(--success);"><i class="bi bi-cloud-check-fill"></i> ' + (data.count || "?") + ' receipt(s) from SharePoint</span>';
+                    var fileNames = (data.files || []).join(", ");
+                    if (rcptBadge) rcptBadge.innerHTML = '<span class="file-badge" style="color:var(--success);"><i class="bi bi-cloud-check-fill"></i> ' + (data.count || "?") + ' receipt(s) staged</span>';
                     if (rcptZone) rcptZone.style.borderColor = "var(--success)";
                 }
-                // OCR started in background — close sync, show progress, poll
-                btnEl.textContent = "OCR Running...";
-                btnEl.style.background = "#f59e0b";
-                _closeSync();
-                var progSection = document.getElementById("progressSection");
-                if (progSection) progSection.style.display = "block";
-                _pollUntilDone();
+                // Stay on sync panel — user can stage more files or close and click Process
             } else {
                 btnEl.disabled = false;
                 btnEl.textContent = origText;
                 btnEl.style.opacity = "1";
-                alert("OCR failed: " + (data.error || "Unknown error"));
+                alert("Stage failed: " + (data.error || "Unknown error"));
             }
         })
         .catch(function(err) {
@@ -3277,30 +3270,6 @@ HTML_TEMPLATE = """
             btnEl.style.opacity = "1";
             alert("Error: " + err);
         });
-    }
-
-    function _pollUntilDone() {
-        fetch("/progress")
-            .then(function(r) { return r.json(); })
-            .then(function(data) {
-                // Update progress UI if elements exist
-                var stepEl = document.getElementById("stepName");
-                var pctEl = document.getElementById("stepPct");
-                var bar = document.getElementById("progressBar");
-                var detail = document.getElementById("progressDetail");
-                if (stepEl) stepEl.innerHTML = '<span class="detail-spinner"></span> ' + (data.step || "Processing...");
-                if (pctEl) pctEl.textContent = data.pct + "%";
-                if (bar) bar.style.width = data.pct + "%";
-                if (detail) detail.textContent = data.detail || "Working...";
-
-                if (data.processing) {
-                    setTimeout(_pollUntilDone, 1000);
-                } else {
-                    // Done — reload page to show results
-                    location.reload();
-                }
-            })
-            .catch(function() { setTimeout(_pollUntilDone, 2000); });
     }
 })();
 </script>
@@ -3447,7 +3416,7 @@ def process():
     receipt_paths = []
     statement_path = None
 
-    # Save uploaded receipts
+    # Save uploaded receipts (from form)
     receipts = request.files.getlist("receipts")
     for f in receipts:
         if f and f.filename:
@@ -3455,15 +3424,27 @@ def process():
             f.save(str(dest))
             receipt_paths.append(str(dest))
 
-    # Save uploaded statement
+    # Save uploaded statement (from form)
     stmt = request.files.get("statement")
     if stmt and stmt.filename:
         dest = UPLOAD_DIR_STATEMENTS / stmt.filename
         stmt.save(str(dest))
         statement_path = str(dest)
 
+    # If no form files, pick up files already staged in uploads/ (e.g. from SharePoint)
+    if not receipt_paths:
+        for img in UPLOAD_DIR_RECEIPTS.glob("*"):
+            if img.suffix.lower() in (".jpg", ".jpeg", ".png") and img.is_file():
+                receipt_paths.append(str(img))
+        receipt_paths.sort()
+
+    if not statement_path:
+        pdfs = sorted(UPLOAD_DIR_STATEMENTS.glob("*.pdf"))
+        if pdfs:
+            statement_path = str(pdfs[-1])  # most recent PDF
+
     if not receipt_paths and not statement_path:
-        flash("No files uploaded.", "warning")
+        flash("No files found. Upload files or stage from SharePoint first.", "warning")
         return redirect(url_for("index"))
 
     target_fn = _run_processing
@@ -3651,16 +3632,15 @@ def api_sync_entity(entity):
         return jsonify({"ok": False, "error": str(e)}), 500
 
 
-@app.route("/api/ocr/sharepoint/<path:entity>", methods=["POST"])
-def api_ocr_sharepoint(entity):
-    """Download file from SharePoint, kick off OCR in background thread.
+@app.route("/api/stage/sharepoint/<path:entity>", methods=["POST"])
+def api_stage_sharepoint(entity):
+    """Download files from SharePoint and save to uploads/ folders.
 
-    Returns immediately with {"ok": true, "status": "started"}.
-    The JS then polls /progress and reloads when done.
+    Statement PDF  → uploads/statements/<name>.pdf
+    Receipt batch  → uploads/receipts/<image1>.jpg, <image2>.png, ...
+
+    Does NOT run OCR — user clicks Process button after staging.
     """
-    if _app_state.get("processing"):
-        return jsonify({"ok": False, "error": "Processing already in progress"}), 409
-
     mapped = _ENTITY_SYNC_MAP.get(entity.strip().lower())
     if not mapped:
         return jsonify({"ok": False, "error": f"Unknown entity '{entity}'"}), 400
@@ -3678,28 +3658,15 @@ def api_ocr_sharepoint(entity):
         if not sp.is_authenticated:
             return jsonify({"ok": False, "error": "SharePoint authentication failed"}), 500
 
-        # Download bytes from SharePoint NOW (fast), then run OCR in background
         if item_type == "statement" and item_id:
             result = sp.get_file_content(item_id)
             if not result["ok"]:
                 return jsonify(result), 500
-            # Check cache — return instantly if cached
-            cached_df = _load_stmt_cache(result["name"])
-            if cached_df is not None:
-                _app_state["df_statements"] = cached_df
-                _try_rematch()
-                _save_state()
-                return jsonify({"ok": True, "status": "cached",
-                                "transactions": len(cached_df)})
-            # Launch background OCR with bytes (zero disk)
-            t = threading.Thread(
-                target=_bg_ocr_statement_bytes,
-                args=(result["bytes"], result["name"]),
-                daemon=True,
-            )
-            t.start()
-            return jsonify({"ok": True, "status": "started",
-                            "filename": result["name"]})
+            # Save PDF to uploads/statements/
+            dest = UPLOAD_DIR_STATEMENTS / result["name"]
+            dest.write_bytes(result["bytes"])
+            return jsonify({"ok": True, "filename": result["name"],
+                            "size": len(result["bytes"])})
 
         elif item_type == "receipt_batch" and folder_id:
             folder_result = sp.get_folder_files(folder_id)
@@ -3708,16 +3675,14 @@ def api_ocr_sharepoint(entity):
             files = folder_result["files"]
             if not files:
                 return jsonify({"ok": False, "error": "No image files in folder"})
-            # Launch background OCR with bytes (zero disk)
-            file_list = [{"name": f["name"], "bytes": f["bytes"]} for f in files]
-            t = threading.Thread(
-                target=_bg_ocr_receipts_bytes,
-                args=(file_list,),
-                daemon=True,
-            )
-            t.start()
-            return jsonify({"ok": True, "status": "started",
-                            "count": len(files)})
+            # Save all images to uploads/receipts/
+            saved = []
+            for f in files:
+                dest = UPLOAD_DIR_RECEIPTS / f["name"]
+                dest.write_bytes(f["bytes"])
+                saved.append(f["name"])
+            return jsonify({"ok": True, "count": len(saved),
+                            "files": saved})
 
         else:
             return jsonify({"ok": False, "error": f"Invalid type '{item_type}'"}), 400
