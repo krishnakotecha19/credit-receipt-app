@@ -11,6 +11,7 @@ Then open:    http://127.0.0.1:5000
 from dotenv import load_dotenv
 load_dotenv(override=True)
 
+from sharepoint_manager import SharePointManager
 import os, re, gc, json, subprocess, sys, threading, time
 import pandas as pd
 import requests
@@ -1505,7 +1506,7 @@ HTML_TEMPLATE = """
         .stat-card {
             background: var(--surface);
             border-radius: var(--radius);
-            padding: 1.25rem;
+            padding: 0.75rem 1rem;
             box-shadow: var(--shadow);
             border: 1px solid var(--border);
             transition: box-shadow 0.2s;
@@ -1514,23 +1515,23 @@ HTML_TEMPLATE = """
             box-shadow: var(--shadow-md);
         }
         .stat-card .stat-icon {
-            width: 40px;
-            height: 40px;
-            border-radius: 10px;
+            width: 32px;
+            height: 32px;
+            border-radius: 8px;
             display: flex;
             align-items: center;
             justify-content: center;
-            font-size: 1.1rem;
-            margin-bottom: 0.75rem;
+            font-size: 1rem;
+            margin-bottom: 0.5rem;
         }
         .stat-card .stat-value {
-            font-size: 1.75rem;
+            font-size: 1.25rem;
             font-weight: 700;
             line-height: 1;
             margin-bottom: 0.25rem;
         }
         .stat-card .stat-label {
-            font-size: 0.78rem;
+            font-size: 0.75rem;
             color: var(--text-muted);
             font-weight: 500;
         }
@@ -3237,6 +3238,36 @@ def api_reassign_stmt():
         "match_score": score,
         "status": df_matches.at[idx, "Status"],
     })
+
+
+@app.route("/api/sync/<entity>", methods=["POST"])
+def api_sync_entity(entity):
+    """
+    Sync SharePoint metadata for the given entity and stage selected files.
+    Payload: { "statement_id": "...", "batch_folder_id": "..." }
+    """
+    try:
+        sp = SharePointManager(entity=entity)
+        if not sp.is_authenticated:
+            return jsonify({"ok": False, "error": "SharePoint authentication failed"}), 500
+            
+        data = request.get_json(force=True, silent=True) or {}
+        statement_id = data.get("statement_id")
+        batch_folder_id = data.get("batch_folder_id")
+        
+        # If no specific files are requested to be staged, just return the available metadata
+        if not statement_id and not batch_folder_id:
+            metadata = sp.sync_inbound_metadata()
+            return jsonify({"ok": True, "metadata": metadata})
+            
+        # If files are requested, stage them locally
+        stage_result = sp.stage_files(statement_id, batch_folder_id)
+        return jsonify(stage_result)
+        
+    except ValueError as e:
+        return jsonify({"ok": False, "error": str(e)}), 400
+    except Exception as e:
+        return jsonify({"ok": False, "error": str(e)}), 500
 
 
 @app.route("/clear")
