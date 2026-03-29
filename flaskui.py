@@ -3240,13 +3240,10 @@ HTML_TEMPLATE = """
         .then(function(r) { return r.json(); })
         .then(function(data) {
             if (data.ok) {
-                btnEl.textContent = "Processing...";
+                btnEl.textContent = "Downloading...";
                 btnEl.style.background = "#f59e0b";
-                // Close sync panel, show progress bar, poll until done
-                _closeSync();
-                var progSection = document.getElementById("progressSection");
-                if (progSection) progSection.style.display = "block";
-                _pollUntilDone();
+                // Stay on sync panel — poll progress and update THIS button
+                _pollForButton(btnEl);
             } else {
                 btnEl.disabled = false;
                 btnEl.textContent = origText;
@@ -3262,30 +3259,27 @@ HTML_TEMPLATE = """
         });
     }
 
-    function _pollUntilDone() {
+    function _pollForButton(btnEl) {
         fetch("/progress")
         .then(function(r) { return r.json(); })
         .then(function(data) {
-            var stepEl = document.getElementById("stepName");
-            var pctEl = document.getElementById("stepPct");
-            var bar = document.getElementById("progressBar");
-            var detail = document.getElementById("progressDetail");
-            var track = document.getElementById("progressTrack");
-            if (stepEl) stepEl.innerHTML = '<span class="detail-spinner"></span> ' + (data.step || "Processing...");
-            if (pctEl) pctEl.textContent = data.pct + "%";
-            if (bar) bar.style.width = data.pct + "%";
-            if (detail) detail.textContent = data.detail || "Working...";
-            if (track) {
-                if (data.pct === 0) track.classList.add("indeterminate");
-                else track.classList.remove("indeterminate");
-            }
+            // Update button text with live progress
+            var txt = (data.step || "Processing") + " " + data.pct + "%";
+            if (data.detail) txt = data.detail;
+            btnEl.textContent = txt;
+
             if (data.processing) {
-                setTimeout(_pollUntilDone, 1000);
+                setTimeout(function() { _pollForButton(btnEl); }, 1000);
             } else {
-                location.reload();
+                // Done — mark button green, keep sync panel open
+                btnEl.textContent = "Done!";
+                btnEl.style.background = "#059669";
+                btnEl.style.opacity = "1";
             }
         })
-        .catch(function() { setTimeout(_pollUntilDone, 2000); });
+        .catch(function() {
+            setTimeout(function() { _pollForButton(btnEl); }, 2000);
+        });
     }
 })();
 </script>
@@ -3806,7 +3800,12 @@ def _bg_download_and_ocr(entity_key, item_type, item_id, folder_id):
             results = extract_receipts_batch(receipt_paths, progress_callback=_cb)
 
             n_ok = sum(1 for r in results if r.get("status") == "success")
-            log(f"Receipts done: {n_ok} success, {len(results) - n_ok} failed")
+            n_fail = len(results) - n_ok
+            log(f"Receipts done: {n_ok} success, {n_fail} failed")
+            # Log failure details for debugging
+            for r in results:
+                if r.get("status") != "success":
+                    log(f"  FAIL {r.get('receipt_file')}: {r.get('raw_text', '')[:200]}")
 
             # Store debug info
             debug = _app_state.get("debug_receipt_ocr", {})
