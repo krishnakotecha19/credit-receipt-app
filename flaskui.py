@@ -2190,7 +2190,7 @@ HTML_TEMPLATE = """
             </select>
 
             <h6><i class="bi bi-credit-card"></i> Credit Card Bank</h6>
-            <select name="credit_card_bank" class="form-select" style="width:100%; margin-bottom: 1rem;">
+            <select name="credit_card_bank" id="ccBankSelect" class="form-select" style="width:100%; margin-bottom: 1rem;">
                 {% for cb in credit_card_bank_options %}
                 <option value="{{ cb }}" {{ 'selected' if cb == credit_card_bank else '' }}>{{ cb if cb else '— Select —' }}</option>
                 {% endfor %}
@@ -2416,7 +2416,7 @@ HTML_TEMPLATE = """
                                     <td>{{ '%.2f'|format(row.receipt_amount|float) if row.receipt_amount else '—' }}</td>
                                     <td>{{ row.receipt_date or '—' }}</td>
                                     <td>{{ row.entity or '—' }}</td>
-                                    <td>{{ row.credit_card_bank or '—' }}</td>
+                                    <td class="cc-bank-cell">{{ row.credit_card_bank or '—' }}</td>
                                     <td>
                                         <select class="form-select form-select-sm cc-select" data-idx="{{ row._idx }}" data-entity="{{ row.entity or entity }}" style="min-width:180px; font-size:0.8rem;">
                                             <option value="">— Select —</option>
@@ -2508,7 +2508,7 @@ HTML_TEMPLATE = """
                                     <td>{{ row.receipt_vendor or '—' }}</td>
                                     <td>{{ '%.2f'|format(row.receipt_amount|float) if row.receipt_amount else '—' }}</td>
                                     <td>{{ row.receipt_date or '—' }}</td>
-                                    <td>{{ row.credit_card_bank or '—' }}</td>
+                                    <td class="cc-bank-cell">{{ row.credit_card_bank or '—' }}</td>
                                     <td>
                                         <select class="form-select form-select-sm cc-select" data-idx="{{ row._idx }}" data-entity="{{ row.entity or entity }}" style="min-width:180px; font-size:0.8rem;">
                                             <option value="">— Select —</option>
@@ -2951,6 +2951,28 @@ HTML_TEMPLATE = """
         document.getElementById('progressSection').style.display = 'block';
         window._progressStartTime = Date.now();
     });
+
+    // Credit card bank — update all matches at runtime
+    var ccBank = document.getElementById('ccBankSelect');
+    if (ccBank) {
+        ccBank.addEventListener('change', function() {
+            var val = this.value;
+            fetch('/api/update-credit-card-bank', {
+                method: 'POST',
+                headers: {'Content-Type': 'application/json'},
+                body: JSON.stringify({value: val})
+            })
+            .then(function(r) { return r.json(); })
+            .then(function(data) {
+                if (data.ok && data.updated > 0) {
+                    // Update all visible credit card bank cells in tables
+                    document.querySelectorAll('td.cc-bank-cell').forEach(function(td) {
+                        td.textContent = val || '—';
+                    });
+                }
+            });
+        });
+    }
 
     // GL code auto-fill when cost centre is selected
     document.querySelectorAll('.cc-select').forEach(sel => {
@@ -3560,6 +3582,23 @@ def api_update_cc():
         df.at[idx, "GL Code"] = gl
         _save_state()
     return jsonify({"ok": True})
+
+
+@app.route("/api/update-credit-card-bank", methods=["POST"])
+def api_update_credit_card_bank():
+    """Update credit card bank on ALL existing match rows at runtime."""
+    data = request.get_json(force=True)
+    value = data.get("value", "")
+    _app_state["credit_card_bank"] = value
+
+    df = _app_state.get("df_matches")
+    updated = 0
+    if df is not None and not df.empty and "Credit Card Bank" in df.columns:
+        df["Credit Card Bank"] = value
+        updated = len(df)
+
+    _save_state()
+    return jsonify({"ok": True, "updated": updated})
 
 
 @app.route("/api/reassign-stmt", methods=["POST"])
