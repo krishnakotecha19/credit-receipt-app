@@ -36,6 +36,12 @@ _SCRIPT_DIR = Path(__file__).resolve().parent
 _RECEIPT_WORKER = str(_SCRIPT_DIR / "ocr_receipt.py")
 _STATEMENT_WORKER = str(_SCRIPT_DIR / "ocr_statement.py")
 
+# Use venv Python if available (subprocess needs packages like cv2, paddleocr, doctr)
+_VENV_PYTHON = _SCRIPT_DIR / "venv" / "Scripts" / "python.exe"
+if not _VENV_PYTHON.exists():
+    _VENV_PYTHON = _SCRIPT_DIR / "venv" / "bin" / "python"  # Linux/Mac
+_PYTHON_EXE = str(_VENV_PYTHON) if _VENV_PYTHON.exists() else sys.executable
+
 UPLOAD_DIR_RECEIPTS = Path("uploads/receipts")
 UPLOAD_DIR_STATEMENTS = Path("uploads/statements")
 CACHE_DIR_STATEMENTS = Path("cache/statements")
@@ -217,7 +223,7 @@ def extract_receipts_batch(image_paths, progress_callback=None, result_callback=
          "date": None, "raw_text": "", "confidence": 0.0, "status": "failed"}
         for p in image_paths
     ]
-    cmd = [sys.executable, _RECEIPT_WORKER] + [str(p) for p in image_paths]
+    cmd = [_PYTHON_EXE, _RECEIPT_WORKER] + [str(p) for p in image_paths]
     timeout = max(600, 180 * len(image_paths))  # 3 min per receipt
     try:
         proc = subprocess.Popen(
@@ -280,7 +286,7 @@ def extract_receipts_batch(image_paths, progress_callback=None, result_callback=
 def process_statement_pdf(pdf_path):
     try:
         proc = subprocess.run(
-            [sys.executable, _STATEMENT_WORKER, str(pdf_path)] +
+            [_PYTHON_EXE, _STATEMENT_WORKER, str(pdf_path)] +
             ([POPPLER_PATH] if POPPLER_PATH else []),
             capture_output=True, text=True, timeout=600, cwd=str(_SCRIPT_DIR),
         )
@@ -296,7 +302,7 @@ def process_statement_pdf(pdf_path):
 def process_statement_pdf_bytes(pdf_bytes: bytes):
     """Run statement OCR via subprocess using stdin bytes (zero disk I/O)."""
     try:
-        cmd = [sys.executable, _STATEMENT_WORKER, "--stdin"] + \
+        cmd = [_PYTHON_EXE, _STATEMENT_WORKER, "--stdin"] + \
               ([POPPLER_PATH] if POPPLER_PATH else [])
         proc = subprocess.run(
             cmd, input=pdf_bytes,
@@ -334,7 +340,7 @@ def extract_receipts_batch_bytes(file_list, progress_callback=None):
         payload += struct.pack(">I", len(name_bytes)) + name_bytes
         payload += struct.pack(">I", len(f["bytes"])) + f["bytes"]
 
-    cmd = [sys.executable, _RECEIPT_WORKER, "--stdin"]
+    cmd = [_PYTHON_EXE, _RECEIPT_WORKER, "--stdin"]
     timeout = max(300, 90 * len(file_list))
 
     try:
