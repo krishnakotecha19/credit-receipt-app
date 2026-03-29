@@ -110,7 +110,7 @@ SI2TECH_MAP = {
 
 ENTITY_OPTIONS = ["Si2Tech", "Vcare Global"]
 ENTITY_COST_MAP = {"Si2Tech": SI2TECH_MAP, "Vcare Global": VCARE_MAP}
-APPROVED_BY_OPTIONS = ["", "Admin"]
+APPROVED_BY_OPTIONS = ["", "Admin", "Finance"]
 CREDIT_CARD_BANK_OPTIONS = ["", "HDFC"]
 
 # ---------------------------------------------------------------------------
@@ -2383,6 +2383,7 @@ HTML_TEMPLATE = """
                                     <th>Credit Card Bank</th>
                                     <th>Cost Centre</th>
                                     <th>GL Code</th>
+                                    <th>Approved By</th>
                                     <th>Match Score</th>
                                     <th>Receipt Scan Accuracy</th>
                                     <th>Statement Scan Accuracy</th>
@@ -2426,6 +2427,13 @@ HTML_TEMPLATE = """
                                         </select>
                                     </td>
                                     <td><span class="gl-code-display" data-idx="{{ row._idx }}">{{ row.gl_code or '—' }}</span></td>
+                                    <td>
+                                        <select class="form-select form-select-sm approved-by-select" data-idx="{{ row._idx }}" style="min-width:100px; font-size:0.8rem;">
+                                            <option value="">— Select —</option>
+                                            <option value="Admin" {{ 'selected' if row.approved_by == 'Admin' else '' }}>Admin</option>
+                                            <option value="Finance" {{ 'selected' if row.approved_by == 'Finance' else '' }}>Finance</option>
+                                        </select>
+                                    </td>
                                     <td><span class="score-badge high">{{ row.match_score }}</span></td>
                                     <td>{{ '%.0f%%'|format(row.ocr_receipt_confidence * 100) if row.ocr_receipt_confidence else '—' }}</td>
                                     <td>{{ '%.0f%%'|format(row.ocr_statement_confidence * 100) if row.ocr_statement_confidence else '—' }}</td>
@@ -2474,6 +2482,7 @@ HTML_TEMPLATE = """
                                     <th>Credit Card Bank</th>
                                     <th>Cost Centre</th>
                                     <th>GL Code</th>
+                                    <th>Approved By</th>
                                     <th>Match Score</th>
                                     <th>Receipt Scan Accuracy</th>
                                     <th>Statement Scan Accuracy</th>
@@ -2518,6 +2527,13 @@ HTML_TEMPLATE = """
                                         </select>
                                     </td>
                                     <td><span class="gl-code-display" data-idx="{{ row._idx }}">{{ row.gl_code or '—' }}</span></td>
+                                    <td>
+                                        <select class="form-select form-select-sm approved-by-select" data-idx="{{ row._idx }}" style="min-width:100px; font-size:0.8rem;">
+                                            <option value="">— Select —</option>
+                                            <option value="Admin" {{ 'selected' if row.approved_by == 'Admin' else '' }}>Admin</option>
+                                            <option value="Finance" {{ 'selected' if row.approved_by == 'Finance' else '' }}>Finance</option>
+                                        </select>
+                                    </td>
                                     <td><span class="score-badge medium">{{ row.match_score }}</span></td>
                                     <td>{{ '%.0f%%'|format(row.ocr_receipt_confidence * 100) if row.ocr_receipt_confidence else '—' }}</td>
                                     <td>{{ '%.0f%%'|format(row.ocr_statement_confidence * 100) if row.ocr_statement_confidence else '—' }}</td>
@@ -2973,6 +2989,19 @@ HTML_TEMPLATE = """
             });
         });
     }
+
+    // Approved By — save per row on change
+    document.querySelectorAll('.approved-by-select').forEach(function(sel) {
+        sel.addEventListener('change', function() {
+            var idx = parseInt(this.dataset.idx);
+            var val = this.value;
+            fetch('/api/update-approved-by', {
+                method: 'POST',
+                headers: {'Content-Type': 'application/json'},
+                body: JSON.stringify({idx: idx, value: val})
+            });
+        });
+    });
 
     // GL code auto-fill when cost centre is selected
     document.querySelectorAll('.cc-select').forEach(sel => {
@@ -3599,6 +3628,19 @@ def api_update_credit_card_bank():
 
     _save_state()
     return jsonify({"ok": True, "updated": updated})
+
+
+@app.route("/api/update-approved-by", methods=["POST"])
+def api_update_approved_by():
+    """Update Approved By for a single match row."""
+    data = request.get_json(force=True)
+    idx = data.get("idx")
+    value = data.get("value", "")
+    df = _app_state.get("df_matches")
+    if df is not None and idx is not None and idx in df.index:
+        df.at[idx, "Approved By"] = value
+        _save_state()
+    return jsonify({"ok": True})
 
 
 @app.route("/api/reassign-stmt", methods=["POST"])
