@@ -3265,9 +3265,11 @@ HTML_TEMPLATE = """
                 if (rb) rb.innerHTML = '<span class="file-badge" style="color:' + (nOk > 0 ? 'var(--success)' : 'var(--danger)') + ';"><i class="bi bi-' + (nOk > 0 ? 'check-circle-fill' : 'exclamation-triangle') + '"></i> ' + nOk + '/' + results.length + ' receipt(s)</span>';
                 var rz = document.getElementById("receiptZone");
                 if (rz) rz.style.borderColor = nOk > 0 ? "var(--success)" : "var(--danger)";
-                // Show "Done" button
-                var doneSection = document.getElementById("reviewDoneSection");
-                if (doneSection) doneSection.style.display = "block";
+                // Show "Done" button only if at least 1 receipt succeeded
+                if (nOk > 0) {
+                    var doneSection = document.getElementById("reviewDoneSection");
+                    if (doneSection) doneSection.style.display = "block";
+                }
             }
         })
         .catch(function() { setTimeout(function() { _pollReceiptReview(btnEl); }, 2000); });
