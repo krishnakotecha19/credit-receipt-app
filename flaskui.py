@@ -147,6 +147,9 @@ _app_state = {
     "processing": False,
     "progress": {"step": "", "pct": 0, "detail": ""},
     "log_lines": [],
+    "wizard_step": None,             # None | "receipts" | "awaiting_statement" | "statement" | "done"
+    "partial_receipt_results": [],    # grows as each receipt is parsed
+    "receipt_file_names": [],         # names of files being processed
 }
 
 # Session persistence
@@ -202,7 +205,11 @@ def _load_image_fixed(path: Path) -> Image.Image:
 # ---------------------------------------------------------------------------
 # Subprocess wrappers (identical to app.py)
 # ---------------------------------------------------------------------------
-def extract_receipts_batch(image_paths, progress_callback=None):
+def extract_receipts_batch(image_paths, progress_callback=None, result_callback=None):
+    """Run receipt OCR subprocess. Callbacks:
+    - progress_callback(done, total) — called per receipt
+    - result_callback(result_dict) — called per receipt with parsed data (for live streaming)
+    """
     if not image_paths:
         return []
     fallbacks = [
@@ -227,6 +234,12 @@ def extract_receipts_batch(image_paths, progress_callback=None):
                         done, total = line.strip().split(":")[1].split("/")
                         progress_callback(int(done), int(total))
                     except (ValueError, IndexError):
+                        pass
+                elif line.startswith("RESULT:") and result_callback:
+                    try:
+                        r = json.loads(line[7:])
+                        result_callback(r)
+                    except (json.JSONDecodeError, ValueError):
                         pass
 
         t = threading.Thread(target=_read_stderr, daemon=True)
@@ -2353,6 +2366,37 @@ HTML_TEMPLATE = """
             </div>
         </div>
 
+        <!-- Receipt Review Table (wizard step 1) -->
+        <div id="receiptReviewPanel" style="display:none; margin-bottom:1.5rem;">
+            <div class="data-card">
+                <div class="card-header">
+                    <h5 id="reviewTableTitle">
+                        <i class="bi bi-hourglass-split" style="color:var(--warning)"></i>
+                        Receipt OCR Progress
+                    </h5>
+                    <span id="reviewTableCount" style="font-size:.85rem;color:var(--text-muted);"></span>
+                </div>
+                <div class="card-body">
+                    <div class="table-wrap">
+                        <table class="data-table" id="receiptReviewTable">
+                            <thead>
+                                <tr>
+                                    <th style="width:70px;">Thumbnail</th>
+                                    <th>File</th>
+                                    <th>Vendor</th>
+                                    <th>Date</th>
+                                    <th>Amount</th>
+                                    <th>Status</th>
+                                </tr>
+                            </thead>
+                            <tbody id="reviewTableBody">
+                            </tbody>
+                        </table>
+                    </div>
+                </div>
+            </div>
+        </div>
+
         <!-- All tab panels wrapped in a container for show/hide -->
         <div id="tabPanelsContainer">
 
@@ -3272,20 +3316,7 @@ HTML_TEMPLATE = """
         btnEl.textContent = "Starting...";
         btnEl.style.opacity = "0.6";
 
-        // Update sidebar drop zone immediately
-        if (type === "statement") {
-            var stmtBadge = document.getElementById("stmtBadge");
-            var stmtZone = document.getElementById("stmtZone");
-            if (stmtBadge) stmtBadge.innerHTML = '<span class="file-badge" style="color:var(--accent);"><i class="bi bi-cloud-arrow-down"></i> ' + (fileName || "SharePoint PDF") + '</span>';
-            if (stmtZone) stmtZone.style.borderColor = "var(--accent)";
-        } else if (type === "receipt_batch") {
-            var rcptBadge = document.getElementById("receiptBadge");
-            var rcptZone = document.getElementById("receiptZone");
-            if (rcptBadge) rcptBadge.innerHTML = '<span class="file-badge" style="color:var(--accent);"><i class="bi bi-cloud-arrow-down"></i> ' + (fileName || "Receipts") + ' (downloading...)</span>';
-            if (rcptZone) rcptZone.style.borderColor = "var(--accent)";
-        }
-
-        var payload = {type: type};
+        var payload = {type: type, file_name: fileName || ""};
         if (type === "receipt_batch") {
             payload.folder_id = id;
         } else {
@@ -3300,9 +3331,30 @@ HTML_TEMPLATE = """
         .then(function(r) { return r.json(); })
         .then(function(data) {
             if (data.ok) {
-                btnEl.textContent = "Downloading...";
-                btnEl.style.background = "#f59e0b";
-                _pollForButton(btnEl, type, fileName);
+                if (data.status === "cached") {
+                    // Statement was cached — reload to show dashboard
+                    btnEl.textContent = "Cached!";
+                    btnEl.style.background = "#059669";
+                    window.location.href = "/";
+                    return;
+                }
+                if (type === "receipt_batch") {
+                    // Wizard Step 1: show review table, poll for streaming results
+                    btnEl.textContent = "Processing...";
+                    btnEl.style.background = "#f59e0b";
+                    document.getElementById("receiptReviewPanel").style.display = "block";
+                    // Update receipt drop zone
+                    var rcptBadge = document.getElementById("receiptBadge");
+                    if (rcptBadge) rcptBadge.innerHTML = '<span class="file-badge" style="color:var(--accent);"><i class="bi bi-cloud-arrow-down"></i> ' + (fileName || "Receipts") + '</span>';
+                    _pollReceiptReview(btnEl);
+                } else {
+                    // Wizard Step 2: statement — poll progress, reload when done
+                    btnEl.textContent = "Downloading...";
+                    btnEl.style.background = "#f59e0b";
+                    var stmtBadge = document.getElementById("stmtBadge");
+                    if (stmtBadge) stmtBadge.innerHTML = '<span class="file-badge" style="color:var(--accent);"><i class="bi bi-cloud-arrow-down"></i> ' + (fileName || "PDF") + '</span>';
+                    _pollStatementProgress(btnEl, fileName);
+                }
             } else {
                 btnEl.disabled = false;
                 btnEl.textContent = origText;
@@ -3318,48 +3370,91 @@ HTML_TEMPLATE = """
         });
     }
 
-    function _pollForButton(btnEl, type, fileName) {
+    // Wizard Step 1: poll /api/receipt-progress, build review table live
+    function _pollReceiptReview(btnEl) {
+        fetch("/api/receipt-progress")
+        .then(function(r) { return r.json(); })
+        .then(function(data) {
+            var tbody = document.getElementById("reviewTableBody");
+            var existing = tbody.querySelectorAll("tr").length;
+            var results = data.results || [];
+            var total = (data.file_names || []).length || "?";
+
+            // Append only NEW rows
+            for (var i = existing; i < results.length; i++) {
+                var r = results[i];
+                var tr = document.createElement("tr");
+                var amtStr = (r.amount != null && r.amount !== "") ? "\u20b9" + Number(r.amount).toFixed(2) : "\u2014";
+                tr.innerHTML =
+                    '<td><img class="receipt-thumb" src="/receipt-image/' + encodeURIComponent(r.receipt_file || "") + '" style="width:50px;height:50px;object-fit:cover;border-radius:4px;" onerror="this.hidden=true"></td>' +
+                    '<td style="font-size:.8rem;">' + (r.receipt_file || "") + '</td>' +
+                    '<td>' + (r.vendor || "\u2014") + '</td>' +
+                    '<td>' + (r.date || "\u2014") + '</td>' +
+                    '<td>' + amtStr + '</td>' +
+                    '<td><span class="status-badge ' + (r.status === "success" ? "approved" : "unmatched") + '" style="font-size:.75rem;">' + (r.status || "pending") + '</span></td>';
+                tbody.appendChild(tr);
+            }
+
+            // Update counter and button
+            document.getElementById("reviewTableCount").textContent = results.length + " / " + total + " processed";
+            btnEl.textContent = "Receipt " + results.length + "/" + total;
+
+            if (data.processing) {
+                setTimeout(function() { _pollReceiptReview(btnEl); }, 1200);
+            } else {
+                // Receipts done — check how many succeeded
+                var nOk = 0;
+                for (var j = 0; j < results.length; j++) {
+                    if (results[j].status === "success") nOk++;
+                }
+                if (nOk > 0) {
+                    document.getElementById("reviewTableTitle").innerHTML =
+                        '<i class="bi bi-check-circle-fill" style="color:var(--success)"></i> ' + nOk + ' Receipt(s) Processed \u2014 Now select a Statement';
+                    btnEl.style.background = "#059669";
+                } else {
+                    // All failed — show error info
+                    var errMsg = "OCR failed for all receipts.";
+                    if (data.logs && data.logs.length > 0) {
+                        errMsg += " Last log: " + data.logs[data.logs.length - 1];
+                    }
+                    document.getElementById("reviewTableTitle").innerHTML =
+                        '<i class="bi bi-exclamation-triangle-fill" style="color:var(--danger)"></i> ' + errMsg;
+                    btnEl.style.background = "#ef4444";
+                }
+                btnEl.textContent = nOk + "/" + results.length + " done";
+                btnEl.style.opacity = "1";
+                // Update receipt drop zone
+                var rb = document.getElementById("receiptBadge");
+                if (rb) rb.innerHTML = '<span class="file-badge" style="color:' + (nOk > 0 ? 'var(--success)' : 'var(--danger)') + ';"><i class="bi bi-' + (nOk > 0 ? 'check-circle-fill' : 'exclamation-triangle') + '"></i> ' + nOk + '/' + results.length + ' receipt(s)</span>';
+                var rz = document.getElementById("receiptZone");
+                if (rz) rz.style.borderColor = nOk > 0 ? "var(--success)" : "var(--danger)";
+            }
+        })
+        .catch(function() { setTimeout(function() { _pollReceiptReview(btnEl); }, 2000); });
+    }
+
+    // Wizard Step 2: poll /progress for statement OCR, reload when done
+    function _pollStatementProgress(btnEl, fileName) {
         fetch("/progress")
         .then(function(r) { return r.json(); })
         .then(function(data) {
-            // Update button text with live progress
-            var txt = (data.detail || data.step || "Processing...") + " " + data.pct + "%";
-            btnEl.textContent = txt;
-
-            // Update drop zone with progress
-            if (type === "receipt_batch") {
-                var rcptBadge = document.getElementById("receiptBadge");
-                if (rcptBadge) rcptBadge.innerHTML = '<span class="file-badge" style="color:var(--accent);"><i class="bi bi-hourglass-split"></i> ' + (data.detail || "Processing...") + '</span>';
-            } else if (type === "statement") {
-                var stmtBadge = document.getElementById("stmtBadge");
-                if (stmtBadge) stmtBadge.innerHTML = '<span class="file-badge" style="color:var(--accent);"><i class="bi bi-hourglass-split"></i> ' + (data.detail || "Processing...") + '</span>';
-            }
+            btnEl.textContent = (data.detail || data.step || "Processing...") + " " + data.pct + "%";
+            var stmtBadge = document.getElementById("stmtBadge");
+            if (stmtBadge) stmtBadge.innerHTML = '<span class="file-badge" style="color:var(--accent);"><i class="bi bi-hourglass-split"></i> ' + (data.detail || "Processing...") + '</span>';
 
             if (data.processing) {
-                setTimeout(function() { _pollForButton(btnEl, type, fileName); }, 1000);
+                setTimeout(function() { _pollStatementProgress(btnEl, fileName); }, 1000);
             } else {
-                // Done — update drop zone to success
-                if (type === "receipt_batch") {
-                    var rb = document.getElementById("receiptBadge");
-                    var rz = document.getElementById("receiptZone");
-                    if (rb) rb.innerHTML = '<span class="file-badge" style="color:var(--success);"><i class="bi bi-check-circle-fill"></i> ' + (fileName || "Receipts") + ' processed</span>';
-                    if (rz) rz.style.borderColor = "var(--success)";
-                } else if (type === "statement") {
-                    var sb = document.getElementById("stmtBadge");
-                    var sz = document.getElementById("stmtZone");
-                    if (sb) sb.innerHTML = '<span class="file-badge" style="color:var(--success);"><i class="bi bi-check-circle-fill"></i> ' + (fileName || "Statement") + ' processed</span>';
-                    if (sz) sz.style.borderColor = "var(--success)";
-                }
+                // Statement done — reload to show full dashboard with matches
                 btnEl.textContent = "Done!";
                 btnEl.style.background = "#059669";
-                btnEl.style.opacity = "1";
-                // Reload page with sync panel open so tabs update with results
-                window.location.href = "/?sp=open";
+                var sb = document.getElementById("stmtBadge");
+                if (sb) sb.innerHTML = '<span class="file-badge" style="color:var(--success);"><i class="bi bi-check-circle-fill"></i> ' + (fileName || "Statement") + ' processed</span>';
+                // Short delay then reload to show dashboard
+                setTimeout(function() { window.location.href = "/"; }, 800);
             }
         })
-        .catch(function() {
-            setTimeout(function() { _pollForButton(btnEl, type, fileName); }, 2000);
-        });
+        .catch(function() { setTimeout(function() { _pollStatementProgress(btnEl, fileName); }, 2000); });
     }
 
     // Auto-open sync panel if page loaded with ?sp=open
@@ -3572,6 +3667,19 @@ def progress():
     })
 
 
+@app.route("/api/receipt-progress")
+def receipt_progress():
+    """Poll endpoint for live receipt review table."""
+    return jsonify({
+        "processing": _app_state.get("processing", False),
+        "wizard_step": _app_state.get("wizard_step"),
+        "file_names": _app_state.get("receipt_file_names", []),
+        "results": _app_state.get("partial_receipt_results", []),
+        "progress": _app_state.get("progress", {"step": "", "pct": 0, "detail": ""}),
+        "logs": _app_state.get("log_lines", [])[-10:],  # last 10 log lines for debugging
+    })
+
+
 @app.route("/approve/<int:idx>")
 def approve(idx):
     df = _app_state.get("df_matches")
@@ -3778,9 +3886,21 @@ def api_ocr_sharepoint(entity):
     item_type = data.get("type", "")
     item_id = data.get("item_id", "")
     folder_id = data.get("folder_id", "")
+    file_name = data.get("file_name", "")
 
     if not item_id and not folder_id:
         return jsonify({"ok": False, "error": "item_id or folder_id required"}), 400
+
+    # For statements, check cache before even starting background thread
+    if item_type == "statement" and file_name:
+        cached_df = _load_stmt_cache(file_name)
+        if cached_df is not None:
+            _app_state["df_statements"] = cached_df
+            _app_state["wizard_step"] = "done"
+            _try_rematch()
+            _save_state()
+            return jsonify({"ok": True, "status": "cached",
+                            "transactions": len(cached_df)})
 
     # Mark processing started and launch background thread
     _app_state["processing"] = True
@@ -3814,7 +3934,9 @@ def _bg_download_and_ocr(entity_key, item_type, item_id, folder_id):
             return
 
         if item_type == "statement" and item_id:
-            # ── Download statement PDF ──
+            # ── Wizard Step 2: Statement ──
+            _app_state["wizard_step"] = "statement"
+
             set_progress("Downloading", 2, "Downloading statement PDF...")
             log("Downloading statement from SharePoint...")
             result = sp.get_file_content(item_id)
@@ -3877,11 +3999,16 @@ def _bg_download_and_ocr(entity_key, item_type, item_id, folder_id):
             else:
                 log("No rows reconstructed from statement.")
 
+            _app_state["wizard_step"] = "done"
             set_progress("Done", 100, "Complete!")
             log("Processing complete!")
 
         elif item_type == "receipt_batch" and folder_id:
-            # ── Download all receipt images ──
+            # ── Wizard Step 1: Receipts ──
+            _app_state["wizard_step"] = "receipts"
+            _app_state["partial_receipt_results"] = []
+
+            # Download all receipt images
             set_progress("Downloading", 2, "Listing receipt folder...")
             log("Downloading receipts from SharePoint...")
             folder_result = sp.get_folder_files(folder_id)
@@ -3898,6 +4025,8 @@ def _bg_download_and_ocr(entity_key, item_type, item_id, folder_id):
                 _app_state["processing"] = False
                 return
 
+            _app_state["receipt_file_names"] = [f["name"] for f in files]
+
             receipt_paths = []
             for i, f in enumerate(files):
                 set_progress("Downloading", max(2, int(2 + (i / len(files)) * 18)),
@@ -3905,10 +4034,10 @@ def _bg_download_and_ocr(entity_key, item_type, item_id, folder_id):
                 dest = UPLOAD_DIR_RECEIPTS / f["name"]
                 dest.write_bytes(f["bytes"])
                 receipt_paths.append(str(dest))
-            del folder_result, files  # free memory
+            del folder_result, files
             log(f"Downloaded {len(receipt_paths)} receipt(s)")
 
-            # ── Run OCR ──
+            # Run OCR with streaming partial results
             set_progress("Receipts", 22, f"Processing {len(receipt_paths)} receipt(s)...")
             log(f"Running receipt OCR on {len(receipt_paths)} file(s)...")
 
@@ -3916,15 +4045,24 @@ def _bg_download_and_ocr(entity_key, item_type, item_id, folder_id):
                 pct = max(22, int(22 + (done / total) * 53))
                 set_progress("Receipts", pct, f"Receipt {done}/{total}")
 
-            results = extract_receipts_batch(receipt_paths, progress_callback=_cb)
+            def _result_cb(r):
+                _app_state["partial_receipt_results"] = \
+                    _app_state["partial_receipt_results"] + [r]
+
+            results = extract_receipts_batch(receipt_paths,
+                                             progress_callback=_cb,
+                                             result_callback=_result_cb)
+
+            # Always sync final results to partial_receipt_results
+            # (in case RESULT: streaming missed some or subprocess failed)
+            _app_state["partial_receipt_results"] = list(results)
 
             n_ok = sum(1 for r in results if r.get("status") == "success")
             n_fail = len(results) - n_ok
             log(f"Receipts done: {n_ok} success, {n_fail} failed")
-            # Log failure details for debugging
             for r in results:
                 if r.get("status") != "success":
-                    log(f"  FAIL {r.get('receipt_file')}: {r.get('raw_text', '')[:200]}")
+                    log(f"  FAIL {r.get('receipt_file')}: {r.get('raw_text', '')[:300]}")
 
             # Store debug info
             debug = _app_state.get("debug_receipt_ocr", {})
@@ -3946,12 +4084,12 @@ def _bg_download_and_ocr(entity_key, item_type, item_id, folder_id):
                     subset="receipt_file", keep="last"
                 ).reset_index(drop=True)
             _app_state["df_receipts"] = df_new
+            _save_state()
 
-            set_progress("Matching", 80, "Matching...")
-            _try_rematch()
-
-            set_progress("Done", 100, f"{n_ok} receipts processed")
-            log("Processing complete!")
+            # DON'T match yet — wait for statement in step 2
+            _app_state["wizard_step"] = "awaiting_statement"
+            set_progress("Done", 100, f"{n_ok} receipts processed — now select a statement")
+            log("Receipts complete. Select a statement to continue.")
 
     except Exception as e:
         log(f"ERROR: {e}")

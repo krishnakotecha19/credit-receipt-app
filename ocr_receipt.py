@@ -1016,6 +1016,7 @@ if __name__ == "__main__":
                      "confidence": 0.0, "status": "failed"}
             results.append(r)
             print(f"PROGRESS:{len(results)}/{n_files}", file=sys.stderr, flush=True)
+            print(f"RESULT:{json.dumps(r, ensure_ascii=False)}", file=sys.stderr, flush=True)
         print(json.dumps(results, ensure_ascii=False))
     else:
         # File path mode (backward compatible)
@@ -1038,4 +1039,5 @@ if __name__ == "__main__":
                     }
                 results.append(data)
                 print(f"PROGRESS:{len(results)}/{len(image_paths)}", file=sys.stderr, flush=True)
+                print(f"RESULT:{json.dumps(data, ensure_ascii=False)}", file=sys.stderr, flush=True)
             print(json.dumps(results, ensure_ascii=False))
