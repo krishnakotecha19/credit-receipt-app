@@ -2321,9 +2321,6 @@ HTML_TEMPLATE = """
             <button type="button" class="tab-btn" data-tab="compare">
                 <i class="bi bi-columns-gap"></i> Receipt vs Statement
             </button>
-            <button type="button" class="tab-btn" data-tab="debug">
-                <i class="bi bi-bug"></i> Debug
-            </button>
         </div>
         <div style="display:flex; align-items:center; justify-content:flex-end; margin:-1rem 0 1rem 0;">
             <button type="button" id="btnSyncSP" style="background:linear-gradient(135deg,#0ea5e9,#6366f1);color:#fff;border:none;border-radius:8px;padding:8px 18px;font-size:0.85rem;font-weight:600;cursor:pointer;display:flex;align-items:center;gap:6px;transition:opacity 0.2s;" onmouseover="this.style.opacity='.85'" onmouseout="this.style.opacity='1'">
@@ -2392,6 +2389,11 @@ HTML_TEMPLATE = """
                             <tbody id="reviewTableBody">
                             </tbody>
                         </table>
+                    </div>
+                    <div id="reviewDoneSection" style="display:none; text-align:center; padding:1.25rem 0;">
+                        <button type="button" id="btnReviewDone" style="background:linear-gradient(135deg,#10b981,#059669);color:#fff;border:none;border-radius:8px;padding:10px 32px;font-size:0.9rem;font-weight:600;cursor:pointer;">
+                            <i class="bi bi-check-lg"></i> Done — Select Statement
+                        </button>
                     </div>
                 </div>
             </div>
@@ -2760,186 +2762,6 @@ HTML_TEMPLATE = """
                 <p>Process receipts and a statement to see side-by-side comparisons.</p>
             </div>
             {% endif %}
-        </div>
-
-        <!-- Tab: Debug -->
-        <div class="tab-panel" id="tab-debug">
-            <div class="data-card">
-                <div class="card-header">
-                    <h5><i class="bi bi-bug"></i> Receipt OCR Debug</h5>
-                </div>
-                <div class="card-body">
-                    {% if debug_receipts %}
-                    <div class="table-wrap">
-                        <table class="data-table">
-                            <thead>
-                                <tr>
-                                    <th>Receipt</th>
-                                    <th>Status</th>
-                                    <th>Vendor</th>
-                                    <th>Amount</th>
-                                    <th>Date</th>
-                                    <th>Confidence</th>
-                                </tr>
-                            </thead>
-                            <tbody>
-                                {% for name, dbg in debug_receipts.items() %}
-                                <tr>
-                                    <td>{{ name }}</td>
-                                    <td><span class="status-badge {{ 'approved' if dbg.status == 'success' else 'unmatched' }}">{{ dbg.status }}</span></td>
-                                    <td>{{ dbg.vendor or '—' }}</td>
-                                    <td>{{ dbg.amount or '—' }}</td>
-                                    <td>{{ dbg.date or '—' }}</td>
-                                    <td>{{ '%.0f%%'|format(dbg.confidence * 100) if dbg.confidence else '—' }}</td>
-                                </tr>
-                                {% endfor %}
-                            </tbody>
-                        </table>
-                    </div>
-                    {% else %}
-                    <div class="empty-state" style="padding:2rem;">
-                        <p>Process receipts to see OCR debug output.</p>
-                    </div>
-                    {% endif %}
-                </div>
-            </div>
-
-            {% if statements_data %}
-            <div class="data-card" style="margin-top:1rem;">
-                <div class="card-header">
-                    <h5><i class="bi bi-file-earmark-text"></i> All Statement Transactions</h5>
-                </div>
-                <div class="card-body">
-                    <div class="table-wrap">
-                        <table class="data-table">
-                            <thead>
-                                <tr>
-                                    <th>Date</th>
-                                    <th>Description</th>
-                                    <th>Amount</th>
-                                    <th>Type</th>
-                                    <th>Confidence</th>
-                                </tr>
-                            </thead>
-                            <tbody>
-                                {% for row in statements_data %}
-                                <tr>
-                                    <td>{{ row.date or '—' }}</td>
-                                    <td>{{ row.description or '—' }}</td>
-                                    <td>{{ '%.2f'|format(row.amount|float) if row.amount else '—' }}</td>
-                                    <td>
-                                        {% if row.type == 'credit' %}
-                                        <span class="status-badge credit">Credit</span>
-                                        {% else %}
-                                        <span class="status-badge" style="background:var(--surface-alt); color:var(--text-muted);">Debit</span>
-                                        {% endif %}
-                                    </td>
-                                    <td>{{ '%.0f%%'|format(row.confidence * 100) if row.confidence else '—' }}</td>
-                                </tr>
-                                {% endfor %}
-                            </tbody>
-                        </table>
-                    </div>
-                </div>
-            </div>
-            {% endif %}
-
-            <!-- Statement OCR Debug: Reconstructed Rows -->
-            <div class="data-card" style="margin-top:1rem;">
-                <div class="card-header" style="display:flex;align-items:center;justify-content:space-between;">
-                    <h5><i class="bi bi-list-columns-reverse"></i> Statement OCR — Reconstructed Rows <span style="font-size:.8rem;font-weight:400;color:var(--text-muted);">(pipe-separated, fed to parser)</span></h5>
-                    <span style="font-size:.8rem;color:var(--text-muted);">{{ debug_stmt_raw_rows|length }} row(s)</span>
-                </div>
-                <div class="card-body" style="padding:0;">
-                    {% if debug_stmt_raw_rows %}
-                    <div style="max-height:420px;overflow-y:auto;">
-                        <table class="data-table" style="font-size:.78rem;font-family:'JetBrains Mono','Courier New',monospace;">
-                            <thead>
-                                <tr>
-                                    <th style="width:2.5rem;">#</th>
-                                    <th>Row (columns separated by  |)</th>
-                                </tr>
-                            </thead>
-                            <tbody>
-                                {% for row in debug_stmt_raw_rows %}
-                                <tr>
-                                    <td style="color:var(--text-muted);text-align:right;">{{ loop.index }}</td>
-                                    <td style="white-space:pre-wrap;word-break:break-all;">{{ row }}</td>
-                                </tr>
-                                {% endfor %}
-                            </tbody>
-                        </table>
-                    </div>
-                    {% else %}
-                    <div class="empty-state" style="padding:1.5rem;">
-                        <p>Process a statement to see reconstructed rows.</p>
-                    </div>
-                    {% endif %}
-                </div>
-            </div>
-
-            <!-- Statement OCR Debug: Raw Words per Page -->
-            <div class="data-card" style="margin-top:1rem;">
-                <div class="card-header">
-                    <h5><i class="bi bi-braces"></i> Statement OCR — Raw Words per Page <span style="font-size:.8rem;font-weight:400;color:var(--text-muted);">(DocTR output, before row assembly)</span></h5>
-                </div>
-                <div class="card-body">
-                    {% if debug_stmt_ocr_words %}
-                    <div style="margin-bottom:.6rem;font-size:.78rem;color:var(--text-muted);">
-                        <span style="background:#f59e0b;color:#000;border-radius:3px;padding:1px 5px;margin-right:.4rem;">₹strip</span> ₹ glyph was stripped from this token
-                        &nbsp;<span style="background:#10b981;color:#fff;border-radius:3px;padding:1px 5px;margin-right:.4rem;">credit</span> credit marker detected
-                        &nbsp;<span style="background:#ef4444;color:#fff;border-radius:3px;padding:1px 5px;">low-conf</span> confidence &lt; 0.6
-                    </div>
-                    {% for page_info in debug_stmt_ocr_words %}
-                    <details style="margin-bottom:.6rem;border:1px solid var(--border);border-radius:8px;overflow:hidden;">
-                        <summary style="padding:.6rem 1rem;cursor:pointer;font-weight:600;background:var(--surface-alt);display:flex;justify-content:space-between;align-items:center;list-style:none;">
-                            <span><i class="bi bi-file-earmark-text"></i>&nbsp; Page {{ page_info.page }} &mdash; {{ page_info.words|length }} words</span>
-                            <span style="font-size:.75rem;font-weight:400;color:var(--text-muted);">{{ page_info.status }}</span>
-                        </summary>
-                        <div style="overflow-x:auto;max-height:380px;overflow-y:auto;">
-                            <table class="data-table" style="font-size:.74rem;font-family:'JetBrains Mono','Courier New',monospace;">
-                                <thead>
-                                    <tr>
-                                        <th style="width:2rem;">#</th>
-                                        <th>Text</th>
-                                        <th>Conf</th>
-                                        <th>x_min</th>
-                                        <th>y_min</th>
-                                        <th>x_max</th>
-                                        <th>y_max</th>
-                                        <th>Flags</th>
-                                    </tr>
-                                </thead>
-                                <tbody>
-                                    {% for w in page_info.words %}
-                                    <tr style="{% if w.get('rupee_prefix_stripped') %}background:rgba(245,158,11,.12);{% elif w.get('has_plus_prefix') %}background:rgba(16,185,129,.08);{% elif w.get('low_confidence') %}background:rgba(239,68,68,.06);{% endif %}">
-                                        <td style="color:var(--text-muted);text-align:right;">{{ loop.index }}</td>
-                                        <td><strong>{{ w.text }}</strong></td>
-                                        <td style="{% if w.confidence < 0.4 %}color:#f87171;{% elif w.confidence < 0.7 %}color:#fb923c;{% else %}color:#4ade80;{% endif %}">{{ '%.2f'|format(w.confidence) }}</td>
-                                        <td>{{ '%.3f'|format(w.x_min) }}</td>
-                                        <td>{{ '%.3f'|format(w.y_min) }}</td>
-                                        <td>{{ '%.3f'|format(w.x_max) }}</td>
-                                        <td>{{ '%.3f'|format(w.y_max) }}</td>
-                                        <td style="font-size:.7rem;white-space:nowrap;">
-                                            {% if w.get('rupee_prefix_stripped') %}<span style="background:#f59e0b;color:#000;border-radius:3px;padding:1px 4px;">₹strip</span> {% endif %}
-                                            {% if w.get('has_plus_prefix') %}<span style="background:#10b981;color:#fff;border-radius:3px;padding:1px 4px;">credit</span> {% endif %}
-                                            {% if w.get('low_confidence') %}<span style="background:#ef4444;color:#fff;border-radius:3px;padding:1px 4px;">low-conf</span> {% endif %}
-                                        </td>
-                                    </tr>
-                                    {% endfor %}
-                                </tbody>
-                            </table>
-                        </div>
-                    </details>
-                    {% endfor %}
-                    {% else %}
-                    <div class="empty-state" style="padding:1.5rem;">
-                        <p>Process a statement to see raw OCR words. (Only available when processing fresh — not from cache.)</p>
-                    </div>
-                    {% endif %}
-                </div>
-            </div>
-
         </div>
 
         </div><!-- /tabPanelsContainer -->
@@ -3409,13 +3231,12 @@ HTML_TEMPLATE = """
                 }
                 if (nOk > 0) {
                     document.getElementById("reviewTableTitle").innerHTML =
-                        '<i class="bi bi-check-circle-fill" style="color:var(--success)"></i> ' + nOk + ' Receipt(s) Processed \u2014 Now select a Statement';
+                        '<i class="bi bi-check-circle-fill" style="color:var(--success)"></i> ' + nOk + ' Receipt(s) Processed';
                     btnEl.style.background = "#059669";
                 } else {
-                    // All failed — show error info
                     var errMsg = "OCR failed for all receipts.";
                     if (data.logs && data.logs.length > 0) {
-                        errMsg += " Last log: " + data.logs[data.logs.length - 1];
+                        errMsg += " " + data.logs[data.logs.length - 1];
                     }
                     document.getElementById("reviewTableTitle").innerHTML =
                         '<i class="bi bi-exclamation-triangle-fill" style="color:var(--danger)"></i> ' + errMsg;
@@ -3428,6 +3249,9 @@ HTML_TEMPLATE = """
                 if (rb) rb.innerHTML = '<span class="file-badge" style="color:' + (nOk > 0 ? 'var(--success)' : 'var(--danger)') + ';"><i class="bi bi-' + (nOk > 0 ? 'check-circle-fill' : 'exclamation-triangle') + '"></i> ' + nOk + '/' + results.length + ' receipt(s)</span>';
                 var rz = document.getElementById("receiptZone");
                 if (rz) rz.style.borderColor = nOk > 0 ? "var(--success)" : "var(--danger)";
+                // Show "Done" button
+                var doneSection = document.getElementById("reviewDoneSection");
+                if (doneSection) doneSection.style.display = "block";
             }
         })
         .catch(function() { setTimeout(function() { _pollReceiptReview(btnEl); }, 2000); });
@@ -3457,10 +3281,18 @@ HTML_TEMPLATE = """
         .catch(function() { setTimeout(function() { _pollStatementProgress(btnEl, fileName); }, 2000); });
     }
 
+    // "Done" button after receipt review — hide review, show SP panel for statement
+    var btnReviewDone = document.getElementById("btnReviewDone");
+    if (btnReviewDone) {
+        btnReviewDone.addEventListener("click", function() {
+            document.getElementById("receiptReviewPanel").style.display = "none";
+            _openSync();
+        });
+    }
+
     // Auto-open sync panel if page loaded with ?sp=open
     if (window.location.search.indexOf("sp=open") !== -1) {
         _openSync();
-        // Clean URL without reload
         if (window.history.replaceState) {
             window.history.replaceState({}, "", window.location.pathname);
         }
@@ -3968,9 +3800,29 @@ def _bg_download_and_ocr(entity_key, item_type, item_id, folder_id):
             # ── Run OCR ──
             set_progress("Statements", 10, f"Running OCR on {filename}...")
             log(f"Running statement OCR on {filename}...")
-            pages = process_statement_pdf(str(dest))
+            try:
+                pages = process_statement_pdf(str(dest))
+            except Exception as ocr_err:
+                log(f"ERROR: Statement OCR subprocess failed: {ocr_err}")
+                set_progress("Done", 100, f"Statement OCR failed: {ocr_err}")
+                _app_state["wizard_step"] = "done"
+                _app_state["processing"] = False
+                _save_state()
+                return
+
             n_words = sum(len(p.get("raw_ocr_words", [])) for p in pages)
             log(f"OCR done: {len(pages)} page(s), {n_words} words")
+
+            # Check if all pages failed
+            failed_pages = [p for p in pages if str(p.get("status", "")).startswith("failed")]
+            if failed_pages and len(failed_pages) == len(pages):
+                err_detail = failed_pages[0].get("status", "unknown error")
+                log(f"ERROR: All pages failed: {err_detail}")
+                set_progress("Done", 100, f"Statement OCR failed: {err_detail}")
+                _app_state["wizard_step"] = "done"
+                _app_state["processing"] = False
+                _save_state()
+                return
 
             _app_state["debug_stmt_ocr_words"] = [
                 {"page": p["page_number"], "status": p.get("status", ""),
@@ -4119,6 +3971,9 @@ def clear():
     _app_state["progress"] = {"step": "", "pct": 0, "detail": ""}
     _app_state["processing"] = False
     _app_state["credit_card_bank"] = ""
+    _app_state["wizard_step"] = None
+    _app_state["partial_receipt_results"] = []
+    _app_state["receipt_file_names"] = []
     _SESSION_CACHE_FILE.unlink(missing_ok=True)
     for f in CACHE_DIR_STATEMENTS.glob("*.json"):
         f.unlink(missing_ok=True)
