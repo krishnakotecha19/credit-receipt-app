@@ -218,7 +218,7 @@ def extract_receipts_batch(image_paths, progress_callback=None, result_callback=
         for p in image_paths
     ]
     cmd = [sys.executable, _RECEIPT_WORKER] + [str(p) for p in image_paths]
-    timeout = max(300, 90 * len(image_paths))
+    timeout = max(600, 180 * len(image_paths))  # 3 min per receipt
     try:
         proc = subprocess.Popen(
             cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
@@ -3014,16 +3014,32 @@ HTML_TEMPLATE = """
     var tabContainer = document.getElementById("tabPanelsContainer");
     var navTabs = document.querySelector(".nav-tabs-custom");
 
+    function _hideTabs() {
+        if (tabContainer) tabContainer.style.display = "none";
+        if (navTabs) navTabs.style.display = "none";
+    }
+
+    function _showTabs() {
+        if (tabContainer) tabContainer.style.display = "";
+        if (navTabs) navTabs.style.display = "";
+    }
+
     function _openSync() {
         var syncDiv = document.getElementById("spSyncPanel");
         if (!syncDiv) return;
         syncDiv.style.display = "block";
+        _hideTabs();
         _doLoadSync();
     }
 
     function _closeSync() {
         var syncDiv = document.getElementById("spSyncPanel");
         if (syncDiv) syncDiv.style.display = "none";
+        var reviewPanel = document.getElementById("receiptReviewPanel");
+        // Only show tabs if review panel is also hidden
+        if (!reviewPanel || reviewPanel.style.display === "none" || reviewPanel.style.display === "") {
+            _showTabs();
+        }
     }
 
     if (syncBtn) {

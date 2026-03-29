@@ -720,6 +720,24 @@ def _parse_llm_response(text: str) -> dict | None:
     return result if result else None
 
 
+_ollama_available = None  # cached check: True/False/None (unchecked)
+
+def _check_ollama():
+    """Quick check if Ollama is reachable. Cached after first call."""
+    global _ollama_available
+    if _ollama_available is not None:
+        return _ollama_available
+    ollama_url = os.environ.get("OLLAMA_URL", "http://localhost:11434")
+    try:
+        resp = requests.get(f"{ollama_url}/api/tags", timeout=5)
+        _ollama_available = resp.status_code == 200
+    except Exception:
+        _ollama_available = False
+    if not _ollama_available:
+        print("Ollama not reachable — skipping VLM/LLM, using OCR+regex only", file=sys.stderr, flush=True)
+    return _ollama_available
+
+
 def _extract_via_llm(image_source, raw_text: str) -> dict | None:
     """Send receipt to local Ollama for extraction.
 
@@ -730,6 +748,9 @@ def _extract_via_llm(image_source, raw_text: str) -> dict | None:
 
     Returns {"vendor": str, "amount": float, "date": "YYYY-MM-DD"} or None.
     """
+    if not _check_ollama():
+        return None
+
     ollama_url = os.environ.get("OLLAMA_URL", "http://localhost:11434")
     ollama_model = os.environ.get("OLLAMA_MODEL", "qwen2.5vl:3b")
 
@@ -776,7 +797,7 @@ def _extract_via_llm(image_source, raw_text: str) -> dict | None:
                     "stream": False,
                     "options": {"temperature": 0.1, "num_predict": 200},
                 },
-                timeout=180,
+                timeout=(5, 120),
             )
             if resp.status_code == 200:
                 result = _parse_llm_response(resp.json().get("response", ""))
@@ -817,21 +838,24 @@ def _extract_via_llm(image_source, raw_text: str) -> dict | None:
         "Use null for fields you cannot find."
     )
 
-    resp = requests.post(
-        f"{ollama_url}/api/generate",
-        json={
-            "model": text_model,
-            "prompt": prompt,
-            "stream": False,
-            "options": {"temperature": 0.1, "num_predict": 200},
-        },
-        timeout=180,
-    )
-    if resp.status_code != 200:
-        print(f"Ollama error {resp.status_code}: {resp.text[:200]}", file=sys.stderr)
+    try:
+        resp = requests.post(
+            f"{ollama_url}/api/generate",
+            json={
+                "model": text_model,
+                "prompt": prompt,
+                "stream": False,
+                "options": {"temperature": 0.1, "num_predict": 200},
+            },
+            timeout=(5, 120),
+        )
+        if resp.status_code != 200:
+            print(f"Ollama error {resp.status_code}: {resp.text[:200]}", file=sys.stderr)
+            return None
+        return _parse_llm_response(resp.json().get("response", ""))
+    except Exception as e:
+        print(f"Text model error: {e}", file=sys.stderr)
         return None
-
-    return _parse_llm_response(resp.json().get("response", ""))
 
 
 def extract_receipt_data(image_path: str) -> dict:
