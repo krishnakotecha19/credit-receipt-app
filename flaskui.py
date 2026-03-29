@@ -3281,12 +3281,14 @@ HTML_TEMPLATE = """
         .catch(function() { setTimeout(function() { _pollStatementProgress(btnEl, fileName); }, 2000); });
     }
 
-    // "Done" button after receipt review — hide review, show SP panel for statement
+    // "Done" button after receipt review — hide review, show SP panel (no re-fetch)
     var btnReviewDone = document.getElementById("btnReviewDone");
     if (btnReviewDone) {
         btnReviewDone.addEventListener("click", function() {
             document.getElementById("receiptReviewPanel").style.display = "none";
-            _openSync();
+            // Just show the sync panel — don't re-fetch from SharePoint
+            var syncDiv = document.getElementById("spSyncPanel");
+            if (syncDiv) syncDiv.style.display = "block";
         });
     }
 
