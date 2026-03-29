@@ -3101,16 +3101,12 @@ HTML_TEMPLATE = """
         var syncDiv = document.getElementById("spSyncPanel");
         if (!syncDiv) return;
         syncDiv.style.display = "block";
-        if (tabContainer) tabContainer.style.display = "none";
-        if (navTabs) navTabs.style.display = "none";
         _doLoadSync();
     }
 
     function _closeSync() {
         var syncDiv = document.getElementById("spSyncPanel");
         if (syncDiv) syncDiv.style.display = "none";
-        if (tabContainer) tabContainer.style.display = "";
-        if (navTabs) navTabs.style.display = "";
     }
 
     if (syncBtn) {
@@ -3225,6 +3221,19 @@ HTML_TEMPLATE = """
         btnEl.textContent = "Starting...";
         btnEl.style.opacity = "0.6";
 
+        // Update sidebar drop zone immediately
+        if (type === "statement") {
+            var stmtBadge = document.getElementById("stmtBadge");
+            var stmtZone = document.getElementById("stmtZone");
+            if (stmtBadge) stmtBadge.innerHTML = '<span class="file-badge" style="color:var(--accent);"><i class="bi bi-cloud-arrow-down"></i> ' + (fileName || "SharePoint PDF") + '</span>';
+            if (stmtZone) stmtZone.style.borderColor = "var(--accent)";
+        } else if (type === "receipt_batch") {
+            var rcptBadge = document.getElementById("receiptBadge");
+            var rcptZone = document.getElementById("receiptZone");
+            if (rcptBadge) rcptBadge.innerHTML = '<span class="file-badge" style="color:var(--accent);"><i class="bi bi-cloud-arrow-down"></i> ' + (fileName || "Receipts") + ' (downloading...)</span>';
+            if (rcptZone) rcptZone.style.borderColor = "var(--accent)";
+        }
+
         var payload = {type: type};
         if (type === "receipt_batch") {
             payload.folder_id = id;
@@ -3242,8 +3251,7 @@ HTML_TEMPLATE = """
             if (data.ok) {
                 btnEl.textContent = "Downloading...";
                 btnEl.style.background = "#f59e0b";
-                // Stay on sync panel — poll progress and update THIS button
-                _pollForButton(btnEl);
+                _pollForButton(btnEl, type, fileName);
             } else {
                 btnEl.disabled = false;
                 btnEl.textContent = origText;
@@ -3259,27 +3267,57 @@ HTML_TEMPLATE = """
         });
     }
 
-    function _pollForButton(btnEl) {
+    function _pollForButton(btnEl, type, fileName) {
         fetch("/progress")
         .then(function(r) { return r.json(); })
         .then(function(data) {
             // Update button text with live progress
-            var txt = (data.step || "Processing") + " " + data.pct + "%";
-            if (data.detail) txt = data.detail;
+            var txt = (data.detail || data.step || "Processing...") + " " + data.pct + "%";
             btnEl.textContent = txt;
 
+            // Update drop zone with progress
+            if (type === "receipt_batch") {
+                var rcptBadge = document.getElementById("receiptBadge");
+                if (rcptBadge) rcptBadge.innerHTML = '<span class="file-badge" style="color:var(--accent);"><i class="bi bi-hourglass-split"></i> ' + (data.detail || "Processing...") + '</span>';
+            } else if (type === "statement") {
+                var stmtBadge = document.getElementById("stmtBadge");
+                if (stmtBadge) stmtBadge.innerHTML = '<span class="file-badge" style="color:var(--accent);"><i class="bi bi-hourglass-split"></i> ' + (data.detail || "Processing...") + '</span>';
+            }
+
             if (data.processing) {
-                setTimeout(function() { _pollForButton(btnEl); }, 1000);
+                setTimeout(function() { _pollForButton(btnEl, type, fileName); }, 1000);
             } else {
-                // Done — mark button green, keep sync panel open
+                // Done — update drop zone to success
+                if (type === "receipt_batch") {
+                    var rb = document.getElementById("receiptBadge");
+                    var rz = document.getElementById("receiptZone");
+                    if (rb) rb.innerHTML = '<span class="file-badge" style="color:var(--success);"><i class="bi bi-check-circle-fill"></i> ' + (fileName || "Receipts") + ' processed</span>';
+                    if (rz) rz.style.borderColor = "var(--success)";
+                } else if (type === "statement") {
+                    var sb = document.getElementById("stmtBadge");
+                    var sz = document.getElementById("stmtZone");
+                    if (sb) sb.innerHTML = '<span class="file-badge" style="color:var(--success);"><i class="bi bi-check-circle-fill"></i> ' + (fileName || "Statement") + ' processed</span>';
+                    if (sz) sz.style.borderColor = "var(--success)";
+                }
                 btnEl.textContent = "Done!";
                 btnEl.style.background = "#059669";
                 btnEl.style.opacity = "1";
+                // Reload page with sync panel open so tabs update with results
+                window.location.href = "/?sp=open";
             }
         })
         .catch(function() {
-            setTimeout(function() { _pollForButton(btnEl); }, 2000);
+            setTimeout(function() { _pollForButton(btnEl, type, fileName); }, 2000);
         });
+    }
+
+    // Auto-open sync panel if page loaded with ?sp=open
+    if (window.location.search.indexOf("sp=open") !== -1) {
+        _openSync();
+        // Clean URL without reload
+        if (window.history.replaceState) {
+            window.history.replaceState({}, "", window.location.pathname);
+        }
     }
 })();
 </script>
